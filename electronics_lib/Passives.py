@@ -166,6 +166,18 @@ def generate_mlcc_table(TABLES: List[str]) -> ProductTable:
 
 
 class SmtCeramicCapacitor(Capacitor, CircuitBlock, GeneratorBlock):
+  TOLERANCE = 0.01
+  PACKAGE_VOLTAGE = [  # sorted by order of preference (lowest voltage to highest voltage)
+    # picked based on the most common voltage rating for a size at 0.1uF, X5R || X7R on Digikey
+    # 10v, 16v, 25v, 50v, 100v, 250v
+    (10, 'Capacitor_SMD:C_0603_1608Metric'),
+    (16, 'Capacitor_SMD:C_0805_2012Metric'),
+    (25, 'Capacitor_SMD:C_1206_3216Metric'),
+    (50, 'Capacitor_SMD:C_2512_6332Metric'),
+    (100, 'Capacitor_SMD:C_1206_3216Metric'),
+    (250, 'Capacitor_SMD:C_2512_6332Metric')
+  ]
+
   @init_in_parent
   def __init__(self, **kwargs):
     super().__init__(**kwargs)
@@ -173,6 +185,68 @@ class SmtCeramicCapacitor(Capacitor, CircuitBlock, GeneratorBlock):
     self.nominal_capacitance = self.Parameter(RangeExpr())
     # defaulted to true in generate logic, since this doesn't exist in Capacitor and during instantiation replacement
     self.voltage_rating = self.Parameter(RangeExpr())
+
+  """Default generator that automatically picks capacitors.
+  For value, preferentially picks the lowest-step E-series (E1 before E3 before E6 ...) value meeting the needs,
+  at +/- 1% tolerance. If an E24 resistor at 1% cannot be found, tries to midpoint of the resistance range to pick an
+  exact value at 1%.
+  If below 1% tolerance is needed, fails. TODO: non-preferentially pick tolerances down to 0.1%, though pricey!
+  Picks the minimum (down to 0603, up to 2512) SMD size for the power requirement. TODO: consider PTH types"""
+  def generate(self) -> None:
+    (voltage_lower, voltage_upper) = self.get(self.voltage)
+    if self._has(self.capacitance):
+      cap_low, cap_high = self.get(self.capacitance)
+    else:
+      assert self._has(self.part), "must specify either capacitance or part number"
+      cap_low = -float('inf')
+      cap_high = float('inf')
+
+    if self._has(self.single_nominal_capacitance):
+      single_cap_max = self.get(self.single_nominal_capacitance.upper()) * 1.2  # TODO tolerance elsewhere
+    else:
+      single_cap_max = float('inf')
+
+    capacitance = (cap_low, cap_high)
+    value = choose_preferred_number(capacitance, self.TOLERANCE, self.E24_SERIES_ZIGZAG, 2)
+
+    if value is None:  # failed to find a preferred capacitor, choose the center within tolerance
+      center = (capacitance[0] + capacitance[1]) / 2
+      min_tolerance = center * self.TOLERANCE
+      if (center - capacitance[0]) < min_tolerance or (capacitance[1] - center < min_tolerance):
+        # TODO should there be a better way of communicating generator failures?
+        raise ValueError(f"Cannot generate 1% capacitor within {capacitance}")
+      value = center
+
+    constr_packages = self.get_opt(self.footprint_name)  # TODO support separators
+    _, reqd_power_min = self.get(self.power)
+    # TODO we only need the first really so this is a bit inefficient
+    # Chosen by a rough scan over available parts on Digikey
+    # at voltages 10v, 16v, 25v, 50v, 100v, 250v
+    # and capacitances 1.0, 2.2, 4.7
+    suitable_packages = [(power, package) for power, package in self.PACKAGE_POWER
+                         if power >= reqd_power_min and (constr_packages is None or package == constr_packages)]
+    if not suitable_packages:
+      raise ValueError(f"Cannot find suitable package for capacitor needing {reqd_power_min} W power")
+
+    self.constrain(self.capacitance == value * Farad(tol=self.TOLERANCE))
+    self.constrain(self.power_rated == suitable_packages[0][0])
+
+    self.footprint(
+      'C', suitable_packages[0][1],
+      {
+        '1': self.a,
+        '2': self.b,
+      },
+      # TODO mfr and part number
+      value=f'{UnitUtils.num_to_prefix(value, 3)}, {self.TOLERANCE * 100:0.3g}%, {suitable_packages[0][0]}W',
+    )
+
+
+
+
+
+
+
 
   # Chosen by a rough scan over available parts on Digikey
   # at voltages 10v, 16v, 25v, 50v, 100v, 250v
