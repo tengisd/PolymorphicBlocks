@@ -219,11 +219,11 @@ class SmtCeramicCapacitor(Capacitor, CircuitBlock, GeneratorBlock):
       value = center
 
     constr_packages = self.get_opt(self.footprint_name)  # TODO support separators
-    _, reqd_power_min = self.get(self.power)
+    #_, reqd_power_min = self.get(self.power)
     # TODO we only need the first really so this is a bit inefficient
     # Chosen by a rough scan over available parts on Digikey
-    suitable_packages = [(voltage, package) for voltage, package in self.PACKAGE_POWER
-                         if voltage >= self.voltage_rating and (constr_packages is None or package == constr_packages)]
+    suitable_packages = [(voltage, package) for voltage, package in self.PACKAGE_VOLTAGE_RATING
+                         if voltage >= 2 * voltage_upper and (constr_packages is None or package == constr_packages)]
     if not suitable_packages:
       raise ValueError(f"Cannot find suitable package for capacitor needing {voltage_upper} V voltage rating")
 
@@ -233,8 +233,8 @@ class SmtCeramicCapacitor(Capacitor, CircuitBlock, GeneratorBlock):
     self.footprint(
       'C', suitable_packages[0][1],
       {
-        '1': self.a,
-        '2': self.b,
+        '1': self.pos,
+        '2': self.neg,
       },
       # TODO mfr and part number
       value=f'{UnitUtils.num_to_prefix(value, 3)}, {self.TOLERANCE * 100:0.3g}%, {suitable_packages[0][0]}W',
