@@ -240,7 +240,7 @@ class GeneratorTransform(TransformUtil.Transform):
 
     self.instantiator = InstantiationTransform(lib, refinement)
     self.scp = SimpleConstPropTransform()
-    self.continue_on_error = continue_on_error
+    self.continue_on_error = False
 
     for path, value in refinement.param_settings.items():
       self.scp.set_value(path, value, "refinement")

@@ -197,15 +197,12 @@ class SmtCeramicCapacitor(Capacitor, CircuitBlock, GeneratorBlock):
     (voltage_lower, voltage_upper) = self.get(self.voltage)
     if self._has(self.capacitance):
       cap_low, cap_high = self.get(self.capacitance)
+      if cap_high == float('inf'):
+        cap_high = 10 * cap_low
     else:
       assert self._has(self.part), "must specify either capacitance or part number"
       cap_low = -float('inf')
       cap_high = float('inf')
-
-    if self._has(self.single_nominal_capacitance):
-      single_cap_max = self.get(self.single_nominal_capacitance.upper()) * 1.2  # TODO tolerance elsewhere
-    else:
-      single_cap_max = float('inf')
 
     capacitance = (cap_low, cap_high)
     value = choose_preferred_number(capacitance, self.TOLERANCE, self.E24_SERIES_ZIGZAG, 2)
