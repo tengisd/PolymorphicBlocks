@@ -7,17 +7,44 @@ import edg.expr.expr
 import edg.init.init
 import edg.util.{DependencyGraph, MutableBiMap}
 import edg.ExprBuilder
+import edg.compiler.ExprRef
 
 
-case class OverassignError(target: IndirectDesignPath,
-                           oldAssign: (DesignPath, String, expr.ValueExpr),
-                           newAssign: (DesignPath, String, expr.ValueExpr)
-                          ) extends Exception(
-  s"Redefinition of $target: old assign $oldAssign, new assign $newAssign"
-)
+sealed trait DepValue  // TODO better name - dependency graph value
+
+object DepValue {
+  case class Param(value: ExprValue) extends DepValue
+  case class Array(elts: Seq[String]) extends DepValue
+}
+
+
+/** Utilities for graphs structured as adjacency matrices (typed Map[T, Iterable[T]]),
+  * which may have back-edges
+  */
+class AdjacencyMatrix[T](mat: Map[T, Iterable[T]]) {
+  /** Returns the set of nodes (matrix keys) reachable from some starting key.
+    */
+  def connectedSet(starting: T): Set[T] = {
+    val setBuilder = mutable.Set[T]()
+    def traverse(node: T): Unit = {
+      if (setBuilder.contains(node)) {
+        return
+      }
+      setBuilder.add(node)
+      for (child <- mat.getOrElse(node, Seq())) {
+        traverse(child)
+      }
+    }
+    traverse(starting)
+    setBuilder.toSet
+  }
+}
 
 
 case class AssignRecord(target: IndirectDesignPath, root: DesignPath, value: expr.ValueExpr, source: SourceLocator)
+
+case class OverassignRecord(assigns: mutable.Set[(DesignPath, String, expr.ValueExpr)] = mutable.Set(),
+                            equals: mutable.Set[IndirectDesignPath] = mutable.Set())
 
 /**
   * Parameter propagation, evaluation, and resolution associated with a single design.
@@ -36,7 +63,7 @@ class ConstProp {
 
   // Assign statements are added to the dependency graph only when arrays are ready
   // This is the authoritative source for the state of any param - in the graph (and its dependencies), or value solved
-  val params = DependencyGraph[IndirectDesignPath, ExprValue]()
+  val params = DependencyGraph[ExprRef, DepValue]()
   val paramTypes = new mutable.HashMap[DesignPath, Class[_ <: ExprValue]]  // only record types of authoritative elements
 
   // Params that have a forced/override value, which must be set before any assign statements are parsed
@@ -47,15 +74,16 @@ class ConstProp {
   // Equality, two entries per equality edge (one per direction / target)
   val equality = mutable.HashMap[IndirectDesignPath, mutable.Buffer[IndirectDesignPath]]()
 
-  // Arrays are currently only defined on ports, and this is set once the array's length is known
-  val arrayElts = DependencyGraph[IndirectDesignPath, Seq[String]]  // empty means not yet known
-
+  // Overassigns, for error tracking
+  // This only tracks overassigns that were discarded, not including assigns that took effect.
+  // Additional analysis is needed to get the full set of conflicting assigns.
+  val discardOverassigns = mutable.HashMap[IndirectDesignPath, OverassignRecord]()
 
   //
   // Callbacks, to be overridden at instantiation site
   //
   def onParamSolved(param: IndirectDesignPath, value: ExprValue): Unit = { }
-  def onArraySolved(array: IndirectDesignPath, elts: Seq[String]): Unit = { }
+  def onArraySolved(array: DesignPath, elts: Seq[String]): Unit = { }
 
 
   //
@@ -76,29 +104,30 @@ class ConstProp {
 
   // Repeated does propagations as long as there is work to do, including both array available and param available.
   protected def update(): Unit = {
-    while (arrayElts.getReady.nonEmpty || params.getReady.nonEmpty) {
-      for (constrTarget <- arrayElts.getReady) {
-        // TODO avoid null hack - but it allows things to fail noisily and should never be used
-        arrayElts.setValue(constrTarget, null)  // remove from ready queue
-        val assign = paramAssign(constrTarget)
-        val deps = new ExprRefDependencies(this, assign.root).map(assign.value)
-        params.addNode(constrTarget, deps.toSeq)
-      }
-      for (constrTarget <- params.getReady) {
-        val assign = paramAssign(constrTarget)
-        val value = new ExprEvaluate(this, assign.root).map(assign.value)
-        params.setValue(constrTarget, value)
-        onParamSolved(constrTarget, value)
-        for (constrTargetEquals <- equality.getOrElse(constrTarget, mutable.Buffer())) {
-          propagateEquality(constrTargetEquals, constrTarget, value)
-        }
+    while (params.getReady.nonEmpty) {
+      val constrTarget = params.getReady.head.asInstanceOf[ExprRef.Param].path
+      val assign = paramAssign(constrTarget)
+      new ExprEvaluatePartial(this, assign.root).map(assign.value) match {
+        case ExprResult.Result(result) =>
+          params.setValue(ExprRef.Param(constrTarget), DepValue.Param(result))
+          onParamSolved(constrTarget, result)
+          for (constrTargetEquals <- equality.getOrElse(constrTarget, mutable.Buffer())) {
+            propagateEquality(constrTargetEquals, constrTarget, result)
+          }
+        case ExprResult.Missing(missing) =>
+          params.addNode(ExprRef.Param(constrTarget), missing.toSeq, update=true)
       }
     }
   }
 
   protected def propagateEquality(dst: IndirectDesignPath, src: IndirectDesignPath, value: ExprValue): Unit = {
-    require(params.getValue(dst).isEmpty, s"redefinition of $dst via equality from $src = $value")
-    params.setValue(dst, value)
+    if (params.getValue(ExprRef.Param(dst)).isDefined) {
+      val record = discardOverassigns.getOrElseUpdate(dst, OverassignRecord())
+      record.equals.add(src)
+      return  // first set "wins"
+    }
+
+    params.setValue(ExprRef.Param(dst), DepValue.Param(value))
     onParamSolved(dst, value)
     for (dstEquals <- equality.getOrElse(dst, mutable.Buffer())) {
       if (dstEquals != src) {  // ignore the backedge for propagation
@@ -117,16 +146,26 @@ class ConstProp {
       return  // ignore forced params
     }
     val paramSourceRecord = (root, constrName, targetExpr)
-    if (params.nodeDefinedAt(target)) {
-      throw OverassignError(target, paramSource(target), paramSourceRecord)
+    if (params.nodeDefinedAt(ExprRef.Param(target))) {
+      val record = discardOverassigns.getOrElseUpdate(target, OverassignRecord())
+      record.assigns.add(paramSourceRecord)
+      return  // first set "wins"
     }
 
     val assign = AssignRecord(target, root, targetExpr, sourceLocator)
     paramAssign.put(target, assign)
     paramSource.put(target, paramSourceRecord)
 
-    val arrayDeps = new ExprArrayDependencies(root).map(targetExpr).map(IndirectDesignPath.fromDesignPath(_))
-    arrayElts.addNode(target, arrayDeps.toSeq)
+    new ExprEvaluatePartial(this, root).map(targetExpr) match {
+      case ExprResult.Result(result) =>
+        params.setValue(ExprRef.Param(target), DepValue.Param(result))
+        onParamSolved(target, result)
+        for (constrTargetEquals <- equality.getOrElse(target, mutable.Buffer())) {
+          propagateEquality(constrTargetEquals, target, result)
+        }
+      case ExprResult.Missing(missing) =>
+        params.addNode(ExprRef.Param(target), missing.toSeq)  // explicitly not an update
+    }
 
     update()
   }
@@ -134,11 +173,13 @@ class ConstProp {
   /** Sets a value directly (without the expr)
     */
   def setValue(target: IndirectDesignPath, value: ExprValue, constrName: String = "setValue"): Unit = {
-    val paramSourceRecord = (DesignPath.root, constrName, ExprBuilder.ValueExpr.Literal(value.toLit))
-    if (params.nodeDefinedAt(target)) {
-      throw OverassignError(target, paramSource(target), paramSourceRecord)
+    val paramSourceRecord = (DesignPath(), constrName, ExprBuilder.ValueExpr.Literal(value.toLit))
+    if (params.nodeDefinedAt(ExprRef.Param(target))) {
+      val record = discardOverassigns.getOrElseUpdate(target, OverassignRecord())
+      record.assigns.add(paramSourceRecord)
+      return  // first set "wins"
     }
-    params.setValue(target, value)
+    params.setValue(ExprRef.Param(target), DepValue.Param(value))
     paramSource.put(target, paramSourceRecord)
     onParamSolved(target, value)
   }
@@ -147,11 +188,10 @@ class ConstProp {
     * TODO: this still preserve semantics that forbid over-assignment, even if those don't do anything
     */
   def setForcedValue(target: IndirectDesignPath, value: ExprValue, constrName: String = "forcedValue"): Unit = {
-    val paramSourceRecord = (DesignPath.root, constrName, ExprBuilder.ValueExpr.Literal(value.toLit))
-    if (params.nodeDefinedAt(target)) {
-      throw OverassignError(target, paramSource(target), paramSourceRecord)
-    }
-    params.setValue(target, value)
+    val paramSourceRecord = (DesignPath(), constrName, ExprBuilder.ValueExpr.Literal(value.toLit))
+    require(!params.nodeDefinedAt(ExprRef.Param(target)), "forced value must be set before assigns")
+
+    params.setValue(ExprRef.Param(target), DepValue.Param(value))
     paramSource.put(target, paramSourceRecord)
     forcedParams += target
     onParamSolved(target, value)
@@ -168,12 +208,17 @@ class ConstProp {
 
     // the initial propagation (if applicable) is tricky
     // we assume that propagations between param1 and its equal nodes, and param2 and its equal nodes, are done prior
-    (params.getValue(param1), params.getValue(param2)) match {
+    (params.getValue(ExprRef.Param(param1)), params.getValue(ExprRef.Param(param2))) match {
       case (Some(param1Value), Some(param2Value)) =>
-        // TODO better exception type?
-        throw new IllegalArgumentException(s"equality between $param1 = $param1Value <-> $param2 = $param2Value with both values already defined")
-      case (Some(param1Value), None) => propagateEquality(param2, param1, param1Value)
-      case (None, Some(param2Value)) => propagateEquality(param1, param2, param2Value)
+        val record1 = discardOverassigns.getOrElseUpdate(param1, OverassignRecord())
+        record1.equals.add(param2)
+        val record2 = discardOverassigns.getOrElseUpdate(param2, OverassignRecord())
+        record2.equals.add(param1)
+        // the equality is ignored otherwise
+      case (Some(param1Value), None) => propagateEquality(param2, param1,
+                                                          param1Value.asInstanceOf[DepValue.Param].value)
+      case (None, Some(param2Value)) => propagateEquality(param1, param2,
+                                                          param2Value.asInstanceOf[DepValue.Param].value)
       case (None, None) => // nothing to be done
     }
 
@@ -181,10 +226,8 @@ class ConstProp {
   }
 
   def setArrayElts(target: DesignPath, elts: Seq[String]): Unit = {
-    val indirectTarget = IndirectDesignPath.fromDesignPath(target)
-    arrayElts.setValue(indirectTarget, elts)
-    onArraySolved(indirectTarget, elts)
-
+    params.setValue(ExprRef.Array(target), DepValue.Array(elts))
+    onArraySolved(target, elts)
     update()
   }
 
@@ -193,11 +236,11 @@ class ConstProp {
     * Can be used to check if parameters are resolved yet by testing against None.
     */
   def getValue(param: IndirectDesignPath): Option[ExprValue] = {
-    params.getValue(param)
+    params.getValue(ExprRef.Param(param)).map(_.asInstanceOf[DepValue.Param].value)
   }
   def getValue(param: DesignPath): Option[ExprValue] = {
     // TODO should this be an implicit conversion?
-    getValue(IndirectDesignPath.fromDesignPath(param))
+    getValue(param.asIndirect)
   }
 
   /**
@@ -208,7 +251,7 @@ class ConstProp {
   }
 
   def getArrayElts(target: DesignPath): Option[Seq[String]] = {
-    arrayElts.getValue(IndirectDesignPath.fromDesignPath(target))
+    params.getValue(ExprRef.Array(target)).map(_.asInstanceOf[DepValue.Array].elts)
   }
 
   /**
@@ -216,8 +259,66 @@ class ConstProp {
     * Ignores indirect references.
     */
   def getUnsolved: Set[DesignPath] = {
-    paramTypes.keySet -- params.knownValueKeys.flatMap(DesignPath.fromIndirectOption)
+    paramTypes.keySet -- params.knownValueKeys.collect {
+      case ExprRef.Param(param) => param
+    }.flatMap(DesignPath.fromIndirectOption)
   }
 
-  def getAllSolved: Map[IndirectDesignPath, ExprValue] = params.toMap
+  def getAllSolved: Map[IndirectDesignPath, ExprValue] = params.toMap.collect {
+    case (ExprRef.Param(param), value) => param -> value.asInstanceOf[DepValue.Param].value
+  }
+
+  def getErrors: Seq[CompilerError.OverAssign] = {
+    // For all the overassigns, return the top-level "first" canonicalized path (merging the equalities)
+    val equalityWithDiscard = equality map { case (target, sources) =>
+      sources.toSeq ++ (discardOverassigns.get(target) match {
+        case Some(record) => record.equals.toSeq
+        case None => Seq()
+      })
+    }
+    val equalityGraph = new AdjacencyMatrix(equality.toMap)
+    val topPaths = discardOverassigns.map { case (target, record) =>
+      val all = equalityGraph.connectedSet(target).toSeq.sortBy(_.steps.head.toString).sortBy(_.steps.length)
+      all.head
+    }.toSet.toSeq//.toSet.toSeq.sortBy(_.steps.head.toString)
+       // .sortBy(_.steps.length)
+
+    topPaths.map { topTarget =>
+      val seen = mutable.Set[IndirectDesignPath]()
+      val assignBuilder = mutable.ListBuffer[CompilerError.OverAssignCause]()
+      def processNode(node: IndirectDesignPath): Unit = {  // traverse in DFS
+        // insert propagated assigns first
+        paramSource.get(node).foreach { case (root, constrName, value) =>
+          assignBuilder += CompilerError.OverAssignCause.Assign(node, root, constrName, value)
+        }
+        // then insert non-propagated assigns
+        discardOverassigns.get(node).foreach { record =>
+          record.assigns.foreach { case (root, constrName, value) =>
+            assignBuilder += CompilerError.OverAssignCause.Assign(node, root, constrName, value)
+          }
+        }
+        // then iterate to propagated equalities
+        for (child <- equality.getOrElse(node, mutable.Seq())) {
+          if (!seen.contains(child)) {
+            seen += child
+            assignBuilder += CompilerError.OverAssignCause.Equal(node, child)
+            processNode(child)
+          }
+        }
+        // then non-propagated equalities
+        discardOverassigns.get(node).foreach { record =>
+          record.equals.foreach { child =>
+            if (!seen.contains(child)) {
+              seen += child
+              assignBuilder += CompilerError.OverAssignCause.Equal(node, child)
+              processNode(child)
+            }
+          }
+        }
+      }
+      seen += topTarget
+      processNode(topTarget)
+      CompilerError.OverAssign(topTarget, assignBuilder.toSeq)
+    }
+  }
 }

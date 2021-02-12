@@ -2,10 +2,8 @@
 """Client and server classes corresponding to protobuf-defined services."""
 import grpc  # type: ignore
 
-from edg_core.edgir import elem_pb2 as elem__pb2
 from edg_core.edgrpc import hdl_pb2 as hdl__pb2
 from edg_core.edgir import ref_pb2 as ref__pb2
-from edg_core.edgir import schema_pb2 as schema__pb2
 
 
 class HdlInterfaceStub(object):
@@ -30,12 +28,12 @@ class HdlInterfaceStub(object):
         self.GetLibraryElement = channel.unary_unary(
                 '/edg.compiler.HdlInterface/GetLibraryElement',
                 request_serializer=hdl__pb2.LibraryRequest.SerializeToString,
-                response_deserializer=schema__pb2.Library.NS.Val.FromString,
+                response_deserializer=hdl__pb2.LibraryResponse.FromString,
                 )
         self.ElaborateGenerator = channel.unary_unary(
                 '/edg.compiler.HdlInterface/ElaborateGenerator',
                 request_serializer=hdl__pb2.GeneratorRequest.SerializeToString,
-                response_deserializer=elem__pb2.HierarchyBlock.FromString,
+                response_deserializer=hdl__pb2.GeneratorResponse.FromString,
                 )
 
 
@@ -82,12 +80,12 @@ def add_HdlInterfaceServicer_to_server(servicer, server):
             'GetLibraryElement': grpc.unary_unary_rpc_method_handler(
                     servicer.GetLibraryElement,
                     request_deserializer=hdl__pb2.LibraryRequest.FromString,
-                    response_serializer=schema__pb2.Library.NS.Val.SerializeToString,
+                    response_serializer=hdl__pb2.LibraryResponse.SerializeToString,
             ),
             'ElaborateGenerator': grpc.unary_unary_rpc_method_handler(
                     servicer.ElaborateGenerator,
                     request_deserializer=hdl__pb2.GeneratorRequest.FromString,
-                    response_serializer=elem__pb2.HierarchyBlock.SerializeToString,
+                    response_serializer=hdl__pb2.GeneratorResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -146,7 +144,7 @@ class HdlInterface(object):
             metadata=None):
         return grpc.experimental.unary_unary(request, target, '/edg.compiler.HdlInterface/GetLibraryElement',
             hdl__pb2.LibraryRequest.SerializeToString,
-            schema__pb2.Library.NS.Val.FromString,
+            hdl__pb2.LibraryResponse.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
 
@@ -163,6 +161,6 @@ class HdlInterface(object):
             metadata=None):
         return grpc.experimental.unary_unary(request, target, '/edg.compiler.HdlInterface/ElaborateGenerator',
             hdl__pb2.GeneratorRequest.SerializeToString,
-            elem__pb2.HierarchyBlock.FromString,
+            hdl__pb2.GeneratorResponse.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)

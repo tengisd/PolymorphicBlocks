@@ -243,7 +243,8 @@ class BaseBlock(HasMetadata, Generic[BaseBlockEdgirType]):
     self._ports.finalize()
 
     if (self.__class__, 'abstract') in self._elt_properties:
-      self.abstract = self.Metadata('abstract')
+      assert isinstance(pb, edgir.HierarchyBlock)
+      pb.is_abstract = True
 
     for cls in self._get_block_bases():
       super_pb = pb.superclasses.add()
@@ -338,9 +339,16 @@ class BaseBlock(HasMetadata, Generic[BaseBlockEdgirType]):
 
     for (name, port) in self._ports.items():
       if port in self._required_ports:
-        pb.constraints[f'(reqd){name}'].CopyFrom(
-          port.is_connected()._expr_to_proto(ref_map)
-        )
+        if isinstance(port, Port):
+          pb.constraints[f'(reqd){name}'].CopyFrom(
+            port.is_connected()._expr_to_proto(ref_map)
+          )
+        elif isinstance(port, Vector):
+          pb.constraints[f'(reqd){name}'].CopyFrom(
+            (port.length() > 0)._expr_to_proto(ref_map)
+          )
+        else:
+          raise ValueError(f"unknown non-optional port type {port}")
         self._namespace_order.append(f'(reqd){name}')
 
     return pb

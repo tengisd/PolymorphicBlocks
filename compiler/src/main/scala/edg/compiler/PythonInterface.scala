@@ -7,8 +7,8 @@ import edg.compiler.{hdl => edgrpc}
 import edg.elem.elem
 import edg.ref.ref
 import edg.schema.schema
-import edg.util.timeExec
-import edg.wir.Library
+import edg.util.{Errorable, timeExec}
+import edg.wir.{Library}
 import edg.IrPort
 
 
@@ -33,24 +33,36 @@ class PythonInterface {
     val (reply, reqTime) = timeExec {
       blockingStub.clearCached(request)
     }
-    debug(s"PyIf:chearCached module (${reqTime} ms)")
+    debug(s"PyIf:clearCached module (${reqTime} ms)")
     reply.toSeq
   }
 
-  def libraryRequest(modules: Seq[String], element: ref.LibraryPath): schema.Library.NS.Val = {
+  def libraryRequest(modules: Seq[String], element: ref.LibraryPath):
+      Errorable[(schema.Library.NS.Val, Option[edgrpc.Refinements])] = {
     val request = edgrpc.LibraryRequest(
       modules=modules,
       element=Some(element)
     )
-    val (reply, reqTime) = timeExec {
+    val (reply, reqTime) = timeExec {  // TODO plumb refinements through
       blockingStub.getLibraryElement(request)
     }
-    debug(s"PyIf:libraryRequest ${element.getTarget.getName} (${reqTime} ms)")
-    reply
+
+    reply.result match {
+      case edgrpc.LibraryResponse.Result.Element(elem) =>
+        debug(s"PyIf:libraryRequest ${element.getTarget.getName} <= ... (${reqTime} ms)")
+        Errorable.Success((elem, reply.refinements))
+      case edgrpc.LibraryResponse.Result.Error(err) =>
+        debug(s"PyIf:libraryRequest ${element.getTarget.getName} <= err $err (${reqTime} ms)")
+        Errorable.Error(err)
+      case edgrpc.LibraryResponse.Result.Empty =>
+        debug(s"PyIf:libraryRequest ${element.getTarget.getName} <= empty (${reqTime} ms)")
+        Errorable.Error("empty response")
+    }
   }
 
   def elaborateGeneratorRequest(modules: Seq[String], element: ref.LibraryPath,
-                                fnName: String, values: Map[ref.LocalPath, ExprValue]): elem.HierarchyBlock = {
+                                fnName: String, values: Map[ref.LocalPath, ExprValue]):
+      Errorable[elem.HierarchyBlock] = {
     val request = edgrpc.GeneratorRequest(
       modules=modules, element=Some(element), fn=fnName,
       values=values.map { case (valuePath, valueValue) =>
@@ -64,13 +76,18 @@ class PythonInterface {
       blockingStub.elaborateGenerator(request)
     }
     debug(s"PyIf:generatorRequest ${element.getTarget.getName} $fnName (${reqTime} ms)")
-    reply
+    reply.result match {
+      case edgrpc.GeneratorResponse.Result.Generated(elem) => Errorable.Success(elem)
+      case edgrpc.GeneratorResponse.Result.Error(err) => Errorable.Error(err)
+      case edgrpc.GeneratorResponse.Result.Empty => Errorable.Error("empty response")
+    }
   }
 }
 
 
 class PythonInterfaceLibrary(py: PythonInterface) extends Library {
   private val elts = mutable.HashMap[ref.LibraryPath, schema.Library.NS.Val.Type]()
+  private val eltsRefinements = mutable.HashMap[ref.LibraryPath, edgrpc.Refinements]()
   private val generatorCache = mutable.HashMap[(ref.LibraryPath, String, Map[ref.LocalPath, ExprValue]),
       elem.HierarchyBlock]()
 
@@ -89,6 +106,7 @@ class PythonInterfaceLibrary(py: PythonInterface) extends Library {
       case (path, data) if path.getTarget.getName.startsWith(module) => path
     }
     elts --= discardKeys
+    eltsRefinements --= discardKeys
 
     val discardGenerator = generatorCache.collect {  // TODO this assumes following the naming convention
       case (key @ (path, fn, values), data) if path.getTarget.getName.startsWith(module) => key
@@ -101,10 +119,15 @@ class PythonInterfaceLibrary(py: PythonInterface) extends Library {
 
   private def fetchEltIfNeeded(path: ref.LibraryPath): Unit = {
     if (!elts.contains(path)) {
-      val reply = py.libraryRequest(modules, path)
-      if (reply.`type`.isDefined) {
-        elts.put(path, reply.`type`)
-      }  // otherwise error handling done by caller
+      py.libraryRequest(modules, path) match {
+        case Errorable.Success((elem, None)) =>
+          elts.put(path, elem.`type`)
+        case Errorable.Success((elem, Some(refinements))) =>
+          elts.put(path, elem.`type`)
+          eltsRefinements.put(path, refinements)
+        case Errorable.Error(err) =>
+          // TODO better error handling and passing
+      }
     }
   }
 
@@ -126,7 +149,9 @@ class PythonInterfaceLibrary(py: PythonInterface) extends Library {
   override def getBlock(path: ref.LibraryPath): elem.HierarchyBlock = {
     fetchEltIfNeeded(path)
     elts.get(path) match {
-      case Some(schema.Library.NS.Val.Type.HierarchyBlock(member)) => member
+      case Some(schema.Library.NS.Val.Type.HierarchyBlock(member)) =>
+        require(!eltsRefinements.isDefinedAt(path))
+        member
       case Some(member) => throw new NoSuchElementException(s"Library element at $path not a block, got ${member.getClass}")
       case None => throw new NoSuchElementException(s"Library does not contain $path")
     }
@@ -149,14 +174,28 @@ class PythonInterfaceLibrary(py: PythonInterface) extends Library {
     }
   }
 
+  def getDesignTop(path: ref.LibraryPath): (elem.HierarchyBlock, edgrpc.Refinements) = {
+    fetchEltIfNeeded(path)
+    val refinements = eltsRefinements.get(path) match {
+      case Some(refinements) => refinements
+      case None => edgrpc.Refinements()
+    }
+    elts.get(path) match {
+      case Some(schema.Library.NS.Val.Type.HierarchyBlock(member)) =>
+        (member, refinements)
+      case Some(member) => throw new NoSuchElementException(s"Library element at $path not a block, got ${member.getClass}")
+      case None => throw new NoSuchElementException(s"Library does not contain $path")
+    }
+  }
+
   override def runGenerator(path: ref.LibraryPath, fnName: String,
-                            values: Map[ref.LocalPath, ExprValue]): elem.HierarchyBlock = {
+                            values: Map[ref.LocalPath, ExprValue]): Errorable[elem.HierarchyBlock] = {
     generatorCache.get((path, fnName, values)) match {
-      case Some(generated) => generated
+      case Some(generated) => Errorable.Success(generated)
       case None =>
-        val generated = py.elaborateGeneratorRequest(modules, path, fnName, values)
-        generatorCache.put((path, fnName, values), generated)
-        generated
+        val result = py.elaborateGeneratorRequest(modules, path, fnName, values)
+        result.map { generatorCache.put((path, fnName, values), _) }
+        result
     }
   }
 }

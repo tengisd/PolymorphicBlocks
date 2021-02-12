@@ -4,9 +4,9 @@ import scala.collection.mutable
 import edg.schema.schema
 import edg.expr.expr
 import edg.ref.ref
-import edg.wir.{DesignPath, IndirectDesignPath, IndirectStep, Refinements}
+import edg.wir.{DesignPath, IndirectDesignPath, IndirectStep, PortLike, Refinements}
 import edg.wir
-import edg.util.DependencyGraph
+import edg.util.{DependencyGraph, Errorable}
 
 
 class IllegalConstraintException(msg: String) extends Exception(msg)
@@ -32,12 +32,29 @@ object ElaborateRecord {
 sealed trait CompilerError
 object CompilerError {
   case class Unelaborated(elaborateRecord: ElaborateRecord, missing: Set[ElaborateRecord]) extends CompilerError  // may be redundant w/ below
+
   case class LibraryElement(path: DesignPath, target: ref.LibraryPath) extends CompilerError
   case class Generator(path: DesignPath, targets: Seq[ref.LibraryPath], fn: String) extends CompilerError
-  case class ConflictingAssign(target: IndirectDesignPath,
-                               oldAssign: (DesignPath, String, expr.ValueExpr),
-                               newAssign: (DesignPath, String, expr.ValueExpr)
-                              ) extends CompilerError
+
+  case class LibraryError(path: DesignPath, target: ref.LibraryPath, err: String) extends CompilerError
+  case class GeneratorError(path: DesignPath, target: ref.LibraryPath, fn: String, err: String) extends CompilerError
+
+  case class OverAssign(target: IndirectDesignPath,
+                        causes: Seq[OverAssignCause]) extends CompilerError
+
+  case class AbstractBlock(path: DesignPath, superclasses: Seq[ref.LibraryPath]) extends CompilerError
+  case class FailedAssertion(root: DesignPath, constrName: String,
+                             value: expr.ValueExpr, result: ExprValue) extends CompilerError
+  case class MissingAssertion(root: DesignPath, constrName: String,
+                              value: expr.ValueExpr, missing: Set[ExprRef]) extends CompilerError
+
+  sealed trait OverAssignCause
+  object OverAssignCause {
+    case class Assign(target: IndirectDesignPath, root: DesignPath, constrName: String, value: expr.ValueExpr)
+        extends OverAssignCause
+    case class Equal(target: IndirectDesignPath, source: IndirectDesignPath)  // TODO constraint info once we track that?
+        extends OverAssignCause
+  }
 }
 
 
@@ -83,7 +100,7 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
 
   // seed const prop with path assertions
   for ((path, value) <- refinements.instanceValues) {
-    constProp.setForcedValue(IndirectDesignPath.fromDesignPath(path), value, "path refinement")
+    constProp.setForcedValue(path.asIndirect, value, "path refinement")
   }
 
   // Supplemental elaboration data structures
@@ -99,11 +116,26 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
   private val errors = mutable.ListBuffer[CompilerError]()
 
   def getErrors(): Seq[CompilerError] = {
-    errors.toSeq ++ elaboratePending.getMissing.map { missingNode =>
+    val assertionErrors = assertions.flatMap { case (root, constrName, value, sourceLocator) =>
+      new ExprEvaluatePartial(constProp, root).map(value) match {
+        case ExprResult.Result(BooleanValue(true)) => None
+        case ExprResult.Result(result) =>
+          Some(CompilerError.FailedAssertion(root, constrName, value, result))
+        case ExprResult.Missing(missing) =>
+          Some(CompilerError.MissingAssertion(root, constrName, value, missing))
+      }
+    }.toSeq
+
+    val pendingErrors = elaboratePending.getMissing.map { missingNode =>
       CompilerError.Unelaborated(missingNode, elaboratePending.nodeMissing(missingNode))
     }.toSeq
+
+    errors.toSeq ++ constProp.getErrors ++ pendingErrors ++ assertionErrors
   }
 
+  // Hook method to be overridden, eg for status
+  //
+  def onElaborate(record: ElaborateRecord) { }
 
   // Seed compilation with the root
   //
@@ -113,8 +145,8 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
   def resolveLink(path: DesignPath): wir.Link = root.resolve(path.steps).asInstanceOf[wir.Link]
   def resolvePort(path: DesignPath): wir.PortLike = root.resolve(path.steps).asInstanceOf[wir.PortLike]
 
-  processBlock(DesignPath.root, root)
-  elaboratePending.setValue(ElaborateRecord.Block(DesignPath.root), None)
+  processBlock(DesignPath(), root)
+  elaboratePending.setValue(ElaborateRecord.Block(DesignPath()), None)
 
   // Actual compilation methods
   //
@@ -131,8 +163,8 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
       s"connected ports at $toLinkPortPath, $fromLinkPortPath with different params")
     for (paramName <- toLinkPortParams) {
       constProp.addEquality(
-        IndirectDesignPath.fromDesignPath(toLinkPortPath) + paramName,
-        IndirectDesignPath.fromDesignPath(fromLinkPortPath) + paramName
+        toLinkPortPath.asIndirect + paramName,
+        fromLinkPortPath.asIndirect + paramName
       )
     }
 
@@ -141,8 +173,8 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
     connectedLinkParams.put(fromLinkPortPath, (linkPath, linkParams))  // propagate CONNECTED_LINK params
     for (linkParam <- linkParams) {
       constProp.addEquality(
-        IndirectDesignPath.fromDesignPath(toLinkPortPath) + IndirectStep.ConnectedLink + linkParam,
-        IndirectDesignPath.fromDesignPath(fromLinkPortPath) + IndirectStep.ConnectedLink + linkParam
+        toLinkPortPath.asIndirect + IndirectStep.ConnectedLink + linkParam,
+        fromLinkPortPath.asIndirect + IndirectStep.ConnectedLink + linkParam
       )
     }
 
@@ -192,9 +224,18 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
       // TODO can / should this share the LibraryElement instantiation logic w/ elaborate BlocklikePorts?
       // TODO .getOrElse is needed for ports that don't get connected, but may want something stricter
       // especially when block side arrays become a thing
-      val newPorts = constProp.getArrayElts(path).getOrElse(Seq()).map { index =>
-        index -> wir.PortLike.fromIrPort(library.getPort(libraryPath), libraryPath)
-      }.toMap
+      val newPorts = constProp.getArrayElts(path) match {
+        case Some(elts) =>
+          elts.map { index =>
+            index -> wir.PortLike.fromIrPort(library.getPort(libraryPath), libraryPath)
+          }.toMap
+        case None =>
+          // TODO: this assumes ports without elts set from connects are empty
+          // TODO: this may need to be revisited with block-side ports
+          constProp.setArrayElts(path, Seq())
+          constProp.setValue(path.asIndirect + IndirectStep.Length, IntValue(0))
+          Map[String, PortLike]()
+      }
       port.setPorts(newPorts)  // the PortArray is elaborated in-place instead of needing a new object
       newPorts.foreach { case (index, subport) =>
         processPort(path + index, subport)
@@ -218,12 +259,13 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
 
   protected def processPortConnected(portPath: DesignPath, port: wir.PortLike): Unit = port match {
     case port @ (_: wir.Port | _: wir.Bundle) =>
-      constProp.setValue(IndirectDesignPath.fromDesignPath(portPath) + IndirectStep.IsConnected,
+      constProp.setValue(portPath.asIndirect + IndirectStep.IsConnected,
         BooleanValue(connectedPorts.contains(portPath)),
         "connected")
-    case port: wir.PortArray => port.getElaboratedPorts.foreach { case (name, subport) =>
-      processPortConnected(portPath + name, subport)
-    }
+    case port: wir.PortArray =>
+      port.getElaboratedPorts.foreach { case (name, subport) =>
+        processPortConnected(portPath + name, subport)
+      }
     case port => throw new NotImplementedError(s"unknown unelaborated port $port")
   }
 
@@ -235,8 +277,8 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
         connectedLinkParams.put(portPath, (linkPath, params))
         params.foreach { paramName =>
           constProp.addEquality(
-            IndirectDesignPath.fromDesignPath(portPath) + IndirectStep.ConnectedLink + paramName,
-            IndirectDesignPath.fromDesignPath(linkPath) + paramName
+            portPath.asIndirect + IndirectStep.ConnectedLink + paramName,
+            linkPath.asIndirect + paramName
           )
         }
         elaboratePending.setValue(ElaborateRecord.ConnectedLink(portPath), None)
@@ -259,15 +301,10 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
   // TODO clean this up... by a lot
   def processBlocklikeConstraint: PartialFunction[(DesignPath, String, expr.ValueExpr, expr.ValueExpr.Expr), Unit] = {
     case (path, constrName, constr, expr.ValueExpr.Expr.Assign(assign)) =>
-      try {
-        constProp.addAssignment(
-          IndirectDesignPath.fromDesignPath(path) ++ assign.dst.get,
-          path, assign.src.get,
-          constrName) // TODO add sourcelocators
-      } catch {
-        case OverassignError(target, oldAssign, newAssign) =>
-          errors += CompilerError.ConflictingAssign(target, oldAssign, newAssign)
-      }
+      constProp.addAssignment(
+        path.asIndirect ++ assign.dst.get,
+        path, assign.src.get,
+        constrName) // TODO add sourcelocators
     case (path, constrName, constr, expr.ValueExpr.Expr.Binary(_) | expr.ValueExpr.Expr.Reduce(_)) =>
       assertions += ((path, constrName, constr, SourceLocator.empty))  // TODO add source locators
     case (path, constrName, constr, expr.ValueExpr.Expr.Ref(target))
@@ -287,7 +324,7 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
       if (!directConnectedPorts.contains(path + name)) {
         // TODO this needs to not be transitive, should only fire for the topmost disconnected
         // TODO this is hacky, to add the recursive elaboration record
-        setPortConnectedLinkParams(path + name, port, DesignPath.root, Seq(), true)
+        setPortConnectedLinkParams(path + name, port, DesignPath(), Seq(), true)
       }
       processPortConnected(path + name, port)
     }
@@ -375,13 +412,15 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
       }.toSeq
       debug(s"Array defined: ${path ++ linkPortArray} = $linkPortArrayElts")
       constProp.setArrayElts(path ++ linkPortArray, linkPortArrayElts)
+      constProp.setValue(path.asIndirect ++ linkPortArray + IndirectStep.Length,
+        IntValue(linkPortArrayElts.length))
     }
 
     // Queue up generators as needed
     for ((generatorFnName, generator) <- block.getGenerators) {
       elaboratePending.addNode(ElaborateRecord.Generator(path, generatorFnName),
         generator.dependencies.map { depPath =>
-          ElaborateRecord.ParamValue(IndirectDesignPath.fromDesignPath(path) ++ depPath)
+          ElaborateRecord.ParamValue(path.asIndirect ++ depPath)
         }
       )
     }
@@ -424,7 +463,7 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
     refinements.classValues.get(refinedLibrary) match {
       case Some(classValueRefinements) => for ((subpath, value) <- classValueRefinements) {
         constProp.setForcedValue(
-          IndirectDesignPath.fromDesignPath(path) ++ subpath, value,
+          path.asIndirect ++ subpath, value,
           s"${refinedLibrary.getTarget.getName} class refinement")
       }
       case None =>
@@ -542,6 +581,8 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
       }.toSeq
       debug(s"Array defined: ${path ++ intPortArray} = $intPortArrayElts")
       constProp.setArrayElts(path ++ intPortArray, intPortArrayElts)
+      constProp.setValue(path.asIndirect ++ intPortArray + IndirectStep.Length,
+        IntValue(intPortArrayElts.length))
     }
 
     // Queue up sub-trees that need elaboration - needs to be post-generate for generators
@@ -579,13 +620,21 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
     val block = resolveBlock(blockPath)
     val generator = block.getGenerators(fnName)
     block.removeGenerator(fnName)
-    val generatedPb = library.runGenerator(block.getBlockClass, fnName,
+    val generatorResult = library.runGenerator(block.getBlockClass, fnName,
       generator.dependencies.map { depPath =>
-        depPath -> constProp.getValue(IndirectDesignPath.fromDesignPath(blockPath) ++ depPath).get
+        depPath -> constProp.getValue(blockPath.asIndirect ++ depPath).get
       }.toMap
     )
-    val generatedDiff = block.dedupGeneratorPb(generatedPb)
-    val generatedDiffBlock = new wir.Block(generatedDiff, Seq(block.getBlockClass), None)
+    val generatedPb = generatorResult match {
+      case Errorable.Success(generatedPb) =>
+        block.dedupGeneratorPb(generatedPb)
+      case Errorable.Error(err) =>
+        import edg.elem.elem
+        errors += CompilerError.GeneratorError(blockPath, block.getBlockClass, fnName, err)
+        elem.HierarchyBlock()
+    }
+
+    val generatedDiffBlock = new wir.Block(generatedPb, Seq(block.getBlockClass), None)
     processBlock(blockPath, generatedDiffBlock)
     block.append(generatedDiffBlock)
   }
@@ -619,10 +668,15 @@ class Compiler(inputDesignPb: schema.Design, library: edg.wir.Library,
     ElemBuilder.Design(root.toPb)
   }
 
+  def evaluateExpr(root: DesignPath, value: expr.ValueExpr): ExprResult = {
+    new ExprEvaluatePartial(constProp, root).map(value)
+  }
+
+  def getParamValue(param: IndirectDesignPath): Option[ExprValue] = constProp.getValue(param)
   def getAllSolved: Map[IndirectDesignPath, ExprValue] = constProp.getAllSolved
 
   def getConnectedLink(port: DesignPath): Option[DesignPath] = connectedLinkParams.get(port) match {
-    case Some((linkPath, linkParams)) if linkPath == DesignPath.root => None  // this is a hack, because disconnected ports generate a dummy entry
+    case Some((linkPath, linkParams)) if linkPath == DesignPath() => None  // this is a hack, because disconnected ports generate a dummy entry
     case Some((linkPath, linkParams)) => Some(linkPath)
     case None => None
   }

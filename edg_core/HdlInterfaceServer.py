@@ -10,17 +10,17 @@ from . import edgrpc, edgir
 from .Core import builder, LibraryElement
 from .Blocks import Link
 from .HierarchyBlock import Block, GeneratorBlock
+from .DesignTop import DesignTop
 from .Ports import Port, Bundle
 
 
-# Cacheing layer around library elements that also provides LibraryPath to class and proto
+# Cacheing layer around library elements that also provides LibraryPath to class
 # (instead of from module and class path) resolution.
-class CachedLibrary():
+class LibraryElementResolver():
   def __init__(self):
     self.seen_modules: Set[ModuleType] = set()
     self.module_contains: Dict[str, Set[str]] = {}
     self.lib_class_map: Dict[str, Type[LibraryElement]] = {}
-    self.lib_proto_map: Dict[str, edgir.Library.NS.Val] = {}
 
   def load_module(self, module_name: str) -> None:
     """Loads a module and indexes the contained library elements so they can be accesed by LibraryPath.
@@ -28,18 +28,16 @@ class CachedLibrary():
     """
     self._search_module(importlib.import_module(module_name))
 
-  def discard_module(self, module_name: str) -> List[str]:
-    all_discarded = self.module_contains.get(module_name, set())
-    discarded: List[str] = []
-    for discard in all_discarded:
+  def discard_module(self, module_name: str) -> Set[str]:
+    discarded = self.module_contains.get(module_name, set())
+    for discard in discarded:
       self.lib_class_map.pop(discard, None)
-      popped = self.lib_proto_map.pop(discard, None)
-      if popped is not None:
-        discarded.append(discard)
     module = importlib.import_module(module_name)
-    self.seen_modules.remove(module)
+    if module in self.seen_modules:  # TODO better discard behavior for never seen module
+      self.seen_modules.remove(module)
     self.module_contains.pop(module_name, None)
     importlib.reload(module)
+    self._search_module(module)
     return discarded
 
   def _search_module(self, module: ModuleType) -> None:
@@ -67,19 +65,6 @@ class CachedLibrary():
         self.lib_class_map[name] = member
         self.module_contains.setdefault(member.__module__, set()).add(name)
 
-  def elaborated_from_path(self, path: edgir.LibraryPath) -> Optional[edgir.Library.NS.Val]:
-    """Assuming the module has been loaded, retrieves a library element by LibraryPath."""
-    dict_key = path.target.name
-    if path.target.name in self.lib_proto_map:
-      return self.lib_proto_map[dict_key]
-    else:
-      if dict_key not in self.lib_class_map:
-        return None
-      else:
-        elaborated = self._elaborate_class(self.lib_class_map[dict_key])
-        self.lib_proto_map[dict_key] = elaborated
-        return elaborated
-
   def class_from_path(self, path: edgir.LibraryPath) -> Optional[Type[LibraryElement]]:
     """Assuming modules have been loaded, retrieves a LibraryElement class by LibraryPath."""
     dict_key = path.target.name
@@ -87,6 +72,26 @@ class CachedLibrary():
       return None
     else:
       return self.lib_class_map[dict_key]
+
+
+class HdlInterface(edgrpc.HdlInterfaceServicer):  # type: ignore
+  def __init__(self, library: LibraryElementResolver, *, verbose: bool = False):
+    self.library = library
+    self.verbose = verbose
+
+  def LibraryElementsInModule(self, request: edgrpc.ModuleName, context) -> \
+      Generator[edgir.LibraryPath, None, None]:
+    raise NotImplementedError
+
+  def ClearCached(self, request: edgrpc.ModuleName, context) -> Generator[edgir.LibraryPath, None, None]:
+    discarded = self.library.discard_module(request.name)
+    if self.verbose:
+      print(f"ClearCached({request.name}) -> None (discarding {len(discarded)})")
+    for discard in discarded:
+      pb = edgir.LibraryPath()
+      pb.target.name = discard
+      yield pb
+    self.library.load_module(request.name)
 
   @staticmethod
   def _elaborate_class(elt_cls: Type[LibraryElement]) -> edgir.Library.NS.Val:
@@ -107,50 +112,39 @@ class CachedLibrary():
     else:
       raise RuntimeError(f"didn't match type of library element {elt_cls}")
 
-
-class HdlInterface(edgrpc.HdlInterfaceServicer):  # type: ignore
-  def __init__(self, library: CachedLibrary, *, verbose: bool = False):
-    self.library = library
-    self.verbose = verbose
-
-  def LibraryElementsInModule(self, request: edgrpc.ModuleName, context) -> \
-      Generator[edgir.LibraryPath, None, None]:
-    raise NotImplementedError
-
-  def ClearCached(self, request: edgrpc.ModuleName, context) -> Generator[edgir.LibraryPath, None, None]:
-    discarded = self.library.discard_module(request.name)
-    if self.verbose:
-      print(f"ClearCached({request.name}) -> None (discarding {len(discarded)})")
-    for discard in discarded:
-      pb = edgir.LibraryPath()
-      pb.target.name = discard
-      yield pb
-    self.library.load_module(request.name)
-
-  def GetLibraryElement(self, request: edgrpc.LibraryRequest, context) -> edgir.Library.NS.Val:
+  def GetLibraryElement(self, request: edgrpc.LibraryRequest, context) -> edgrpc.LibraryResponse:
     for module_name in request.modules:  # TODO: this isn't completely hermetic in terms of library searching
       self.library.load_module(module_name)
 
+    response = edgrpc.LibraryResponse()
     try:
-      library_elt = self.library.elaborated_from_path(request.element)
+      cls = self.library.class_from_path(request.element)
+      if cls is None:
+        response.error = f"No library elt {request.element}"
+      else:
+        response.element.CopyFrom(self._elaborate_class(cls))
+        if issubclass(cls, DesignTop):  # TODO don't create another instance, perhaps refinements should be static?
+          cls().refinements().populate_proto(response.refinements)
     except BaseException as e:
       traceback.print_exc()
       print(f"while serving library element request for {request.element.target.name}")
-      library_elt = None
+      response.error = str(e)
 
-    if library_elt is not None:
-      if self.verbose:
+    if self.verbose:
+      if response.HasField('error'):
+        print(f"GetLibraryElement([{', '.join(request.modules)}], {request.element.target.name}) -> Error {response.error}")
+      elif response.HasField('refinements'):
+        print(f"GetLibraryElement([{', '.join(request.modules)}], {request.element.target.name}) -> ... (w/ refinements)")
+      else:
         print(f"GetLibraryElement([{', '.join(request.modules)}], {request.element.target.name}) -> ...")
-      return library_elt
-    else:
-      if self.verbose:
-        print(f"GetLibraryElement([{', '.join(request.modules)}], {request.element.target.name}) -> None")
-      return edgir.Library.NS.Val()  # TODO better more explicit failure?
 
-  def ElaborateGenerator(self, request: edgrpc.GeneratorRequest, context) -> edgir.HierarchyBlock:
+    return response
+
+  def ElaborateGenerator(self, request: edgrpc.GeneratorRequest, context) -> edgrpc.GeneratorResponse:
     for module_name in request.modules:  # TODO: this isn't completely hermetic in terms of library searching
       self.library.load_module(module_name)
 
+    response = edgrpc.GeneratorResponse()
     try:
       generator_type = self.library.class_from_path(request.element)
       assert generator_type is not None, f"no generator {request.element}"
@@ -161,20 +155,19 @@ class HdlInterface(edgrpc.HdlInterfaceServicer):  # type: ignore
       generator_values = [(path, value)  # purge None from values to make the typer happy
                           for (path, value) in generator_values_raw
                           if value is not None]
-      generated: Optional[edgir.HierarchyBlock] = builder.elaborate_toplevel(
+      response.generated.CopyFrom(builder.elaborate_toplevel(
         generator_obj, f"in generate {request.fn} for {request.element}",
         replace_superclass=False,
-        generate_fn_name=request.fn, generate_values=generator_values)
+        generate_fn_name=request.fn, generate_values=generator_values))
     except BaseException as e:
       traceback.print_exc()
       print(f"while serving generator request for {request.element.target.name}")
-      generated = None
+      response.error = str(e)
 
-    if generated is not None:
-      if self.verbose:
-        print(f"ElaborateGenerator([{', '.join(request.modules)}], {request.element.target.name, ...}) -> None")
-      return generated
-    else:
-      if self.verbose:
-        print(f"ElaborateGenerator([{', '.join(request.modules)}], {request.element.target.name, ...}) -> None")
-      return edgir.HierarchyBlock()
+    if self.verbose:
+      if response.HasField('error'):
+        print(f"ElaborateGenerator([{', '.join(request.modules)}], {request.element.target.name}) -> Error {response.error}")
+      else:
+        print(f"ElaborateGenerator([{', '.join(request.modules)}], {request.element.target.name}) -> ...")
+
+    return response
