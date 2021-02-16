@@ -1,6 +1,5 @@
 import unittest
 
-from typing import Tuple
 from . import *
 from .ScalaCompilerInterface import ScalaCompiler
 
@@ -102,11 +101,11 @@ class TestGeneratorIsConnected(GeneratorBlock):
   def __init__(self) -> None:
     super().__init__()
     self.port = self.Port(TestPortSource(2.0), optional=True)
-    self.generator(self.generate_assign, self.port.is_connected())
+    self.generator(self.generate_assign, req_ports=[self.port])
     self.connected = self.Parameter(BoolExpr())
 
-  def generate_assign(self, is_connected: bool) -> None:
-    if is_connected:
+  def generate_assign(self) -> None:
+    if self.get(self.port.is_connected()):
       self.assign(self.connected, True)
     else:
       self.assign(self.connected, False)
@@ -183,19 +182,6 @@ class TestGeneratorFailure(GeneratorBlock):
 
 class GeneratorFailureTestCase(unittest.TestCase):
   def test_metadata(self) -> None:
-    compiled = ScalaCompiler.compile(TestGeneratorFailure)
-    pb = compiled.contents
-
-    self.assertIn('GenerateError_errorfn', pb.meta.members.node)
-
-    self.assertIn("TestGeneratorException",
-                  pb.meta.members.node['GenerateError_errorfn'].error.message)
-    self.assertIn("test text",
-                  pb.meta.members.node['GenerateError_errorfn'].error.message)
-    self.assertIn("float_param=41",
-                  pb.meta.members.node['GenerateError_errorfn'].error.message)
-
-    self.assertIn("errorfn",
-                  pb.meta.members.node['GenerateError_errorfn'].error.traceback)
-    self.assertIn("helperfn",
-                  pb.meta.members.node['GenerateError_errorfn'].error.traceback)
+    # TODO some way to check the messages are plumbed through?
+    with self.assertRaises(AssertionError) as context:
+      ScalaCompiler.compile(TestGeneratorFailure)

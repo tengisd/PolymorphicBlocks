@@ -2,10 +2,12 @@ from electronics_abstract_parts import *
 
 
 class Tps561201_Device(DiscreteChip, CircuitBlock):
-  def __init__(self):
+  @init_in_parent
+  def __init__(self, current_draw: RangeLike = RangeExpr()):
     super().__init__()
     self.pwr_in = self.Port(ElectricalSink(
-      voltage_limits=(4.5, 17)*Volt
+      voltage_limits=(4.5, 17)*Volt,
+      current_draw=current_draw
     ))
     self.gnd = self.Port(Ground())
     self.sw = self.Port(ElectricalSource())  # internal switch specs not defined, only bulk current limit defined
@@ -29,22 +31,42 @@ class Tps561201_Device(DiscreteChip, CircuitBlock):
     )
 
 
-class Tps561201(DiscreteBuckConverter):
+class Tps561201(DiscreteBuckConverter, GeneratorBlock):
   """Adjustable synchronous buck converter in SOT-23-6 with integrated switch"""
   def contents(self):
     super().contents()
 
     self.constrain(self.pwr_out.voltage_out.within((0.76, 17)*Volt))
-    self.constrain(self.pwr_out.current_limits == (0, 1.2)*Amp)
-    self.constrain(self.frequency == 580*kHertz(tol=0))
-    self.constrain(self.efficiency == (0.7, 0.95))  # Efficiency stats from first page for ~>10mA
+    self.assign(self.frequency, 580*kHertz(tol=0))
+    self.assign(self.efficiency, (0.7, 0.95))  # Efficiency stats from first page for ~>10mA  # TODO dedup w/ worst estimate?
 
-  def generate(self) -> None:
-    super().generate()
+    self.fb = self.Block(FeedbackVoltageDivider(
+      output_voltage=(0.749, 0.787) * Volt,
+      impedance=(1, 10) * kOhm,
+      assumed_input_voltage=self.spec_output_voltage
+    ))
+    self.assign(self.pwr_out.voltage_out,
+                (0.749*Volt / self.fb.selected_ratio.upper(),
+                 0.787*Volt / self.fb.selected_ratio.lower()))
 
-    self.ic = self.Block(Tps561201_Device())
+    self.generator(self.generate_converter,
+                   self.pwr_in.link().voltage, self.pwr_out.voltage_out,
+                   self.pwr_out.link().current_drawn,
+                   self.frequency, self.output_ripple_limit, self.input_ripple_limit, self.ripple_current_factor,
+                   targets=[self.fb, self.pwr_in, self.pwr_out, self.gnd])
+
+  def generate_converter(self, input_voltage: RangeVal, output_voltage: RangeVal,
+                         output_current: RangeVal, frequency: RangeVal,
+                         spec_output_ripple: float, spec_input_ripple: float, ripple_factor: RangeVal) -> None:
+    self.ic = self.Block(Tps561201_Device(
+      current_draw=(self.pwr_out.link().current_drawn.lower() * self.pwr_out.voltage_out.lower() / self.pwr_in.link().voltage.upper() / self.efficiency.upper(),
+                    self.pwr_out.link().current_drawn.upper() * self.pwr_out.voltage_out.upper() / self.pwr_in.link().voltage.lower() / self.efficiency.lower())
+    ))
     self.connect(self.pwr_in, self.ic.pwr_in)
     self.connect(self.gnd, self.ic.gnd)
+    self.connect(self.fb.output, self.ic.fb)  # TODO should be in contents, but can't have split nets
+    self.connect(self.fb.input, self.pwr_out)
+    self.connect(self.fb.gnd, self.gnd)
 
     self.hf_in_cap = self.Block(DecouplingCapacitor(capacitance=0.1*uFarad(tol=0.2)))  # Datasheet 8.2.2.4
     self.connect(self.hf_in_cap.pwr, self.pwr_in)
@@ -54,24 +76,16 @@ class Tps561201(DiscreteBuckConverter):
     self.connect(self.vbst_cap.neg.as_electrical_sink(), self.ic.sw)
     self.connect(self.vbst_cap.pos.as_electrical_sink(), self.ic.vbst)
 
-    self.fb = self.Block(VoltageDivider(
-      output_voltage=(0.749, 0.787) * Volt,
-      impedance=(1, 10) * kOhm,
-      tolerance_out_to_in=True
-    ))
-    self.connect(self.fb.pwr, self.pwr_out)
-    self.connect(self.fb.gnd, self.gnd)
-    self.connect(self.fb.out, self.ic.fb)
-
     # TODO dedup across all converters
-    inductor_out = self._generate_converter(self.ic.sw, 1.2)
-    self.constrain(self.ic.pwr_in.current_draw == (
-      self.pwr_out.link().current_drawn.lower() * inductor_out.voltage_out.lower() / self.pwr_in.link().voltage.upper() / self.efficiency.upper(),
-      self.pwr_out.link().current_drawn.upper() * inductor_out.voltage_out.upper() / self.pwr_in.link().voltage.lower() / self.efficiency.lower(),
-    ))
-    self.constrain(inductor_out.voltage_out == (
-      0.749*Volt / self.fb.ratio.upper(),
-      0.787*Volt / self.fb.ratio.lower()
+    inductor_out = self._generate_converter(self.ic.sw, 1.2,
+                                            input_voltage=input_voltage, output_voltage=output_voltage,
+                                            output_current_max=output_current[1], frequency=frequency,
+                                            spec_output_ripple=spec_output_ripple, spec_input_ripple=spec_input_ripple,
+                                            ripple_factor=ripple_factor)
+
+    self.connect(self.pwr_out, inductor_out.as_electrical_source(
+      voltage_out=self.pwr_out.voltage_out,  # leave blank, set in contents()
+      current_limits=(0, 1.2)*Amp
     ))
 
     # The control mechanism requires a specific capacitor / inductor selection, datasheet 8.2.2.3
@@ -114,7 +128,7 @@ class Tps54202h_Device(DiscreteChip, CircuitBlock):
     )
 
 
-class Tps54202h(DiscreteBuckConverter):
+class Tps54202h(DiscreteBuckConverter, GeneratorBlock):
   """Adjustable synchronous buck converter in SOT-23-6 with integrated switch, 4.5-24v capable"""
   def contents(self):
     super().contents()
@@ -212,7 +226,7 @@ class Lmr33630_Device(DiscreteChip, CircuitBlock):
     )
 
 
-class Lmr33630(DiscreteBuckConverter):
+class Lmr33630(DiscreteBuckConverter, GeneratorBlock):
   """Adjustable synchronous buck converter in SOIC-8 EP with integrated switch"""
   DUTYCYCLE_MIN_LIMIT = 0.0
   DUTYCYCLE_MAX_LIMIT = 0.98
@@ -297,7 +311,7 @@ class Ap3012_Device(DiscreteChip, CircuitBlock):
     )
 
 
-class Ap3012(DiscreteBoostConverter):
+class Ap3012(DiscreteBoostConverter, GeneratorBlock):
   """Adjustable boost converter in SOT-23-5 with integrated switch"""
   def contents(self):
     super().contents()

@@ -209,6 +209,9 @@ class ConstProp {
     // the initial propagation (if applicable) is tricky
     // we assume that propagations between param1 and its equal nodes, and param2 and its equal nodes, are done prior
     (params.getValue(ExprRef.Param(param1)), params.getValue(ExprRef.Param(param2))) match {
+      case (Some(param1Value), Some(param2Value)) if param1Value == param2Value =>  // nop, already propagated
+        // TODO: are these good semantics?
+        // TODO: should this be recorded for debugging purposes / w/e?
       case (Some(param1Value), Some(param2Value)) =>
         val record1 = discardOverassigns.getOrElseUpdate(param1, OverassignRecord())
         record1.equals.add(param2)
@@ -268,7 +271,7 @@ class ConstProp {
     case (ExprRef.Param(param), value) => param -> value.asInstanceOf[DepValue.Param].value
   }
 
-  def getErrors: Seq[CompilerError.OverAssign] = {
+  def getErrors: Seq[CompilerError] = {
     // For all the overassigns, return the top-level "first" canonicalized path (merging the equalities)
     val equalityWithDiscard = equality map { case (target, sources) =>
       sources.toSeq ++ (discardOverassigns.get(target) match {
@@ -283,7 +286,7 @@ class ConstProp {
     }.toSet.toSeq//.toSet.toSeq.sortBy(_.steps.head.toString)
        // .sortBy(_.steps.length)
 
-    topPaths.map { topTarget =>
+    val overassignErrors = topPaths.map { topTarget =>
       val seen = mutable.Set[IndirectDesignPath]()
       val assignBuilder = mutable.ListBuffer[CompilerError.OverAssignCause]()
       def processNode(node: IndirectDesignPath): Unit = {  // traverse in DFS
@@ -320,5 +323,15 @@ class ConstProp {
       processNode(topTarget)
       CompilerError.OverAssign(topTarget, assignBuilder.toSeq)
     }
+
+    // Also get all empty range assignments
+    val emptyRangeErrors = params.toMap.collect {
+      case (ExprRef.Param(targetPath), DepValue.Param(range: RangeValue)) if range.isEmpty =>
+        paramSource.get(targetPath).map { case (root, constrName, value) =>
+          CompilerError.EmptyRange(targetPath, root, constrName, value)
+        }
+    }.flatten.toSeq
+
+    overassignErrors ++ emptyRangeErrors
   }
 }

@@ -26,8 +26,6 @@ class DigitalLink(CircuitLink):  # can't subclass ElectricalLink because the con
 
     self.output_thresholds = self.Parameter(RangeExpr())
     self.input_thresholds = self.Parameter(RangeExpr())
-    self.input_low_threshold = self.Parameter(FloatExpr())
-    self.input_high_threshold = self.Parameter(FloatExpr())
 
     self.pullup_capable = self.Parameter(BoolExpr())
     self.pulldown_capable = self.Parameter(BoolExpr())
@@ -57,7 +55,7 @@ class DigitalLink(CircuitLink):  # can't subclass ElectricalLink because the con
     self.assign(self.voltage_limits,
       self.sinks.intersection(lambda x: x.voltage_limits).intersect(self.bidirs.intersection(lambda x: x.voltage_limits))
     )
-    self.constrain(self.voltage_limits.contains(self.voltage))
+    self.constrain(self.voltage_limits.contains(self.voltage), "overvoltage")
 
     self.assign(self.current_drawn,
       self.sinks.sum(lambda x: x.current_draw) + self.bidirs.sum(lambda x: x.current_draw)
@@ -67,7 +65,7 @@ class DigitalLink(CircuitLink):  # can't subclass ElectricalLink because the con
       self.bidirs.intersection(lambda x: x.current_limits)
       )
     )
-    self.constrain(self.current_limits.contains(self.current_drawn))
+    self.constrain(self.current_limits.contains(self.current_drawn), "overcurrent")
 
     source_output_thresholds = self.source.is_connected().then_else(  # TODO: clean up
       self.source.output_thresholds,
@@ -79,11 +77,12 @@ class DigitalLink(CircuitLink):  # can't subclass ElectricalLink because the con
                 source_output_thresholds.intersect(
                   bidirs_output_thresholds.intersect(
                     single_output_thresholds)))
+
     self.assign(self.input_thresholds, (  # TODO: clean up
       self.sinks.min(lambda x: x.input_thresholds).min(self.bidirs.min(lambda x: x.input_thresholds)),
       self.sinks.max(lambda x: x.input_thresholds).max(self.bidirs.max(lambda x: x.input_thresholds))
     ))
-    self.constrain(self.output_thresholds.contains(self.input_thresholds))
+    self.constrain(self.output_thresholds.contains(self.input_thresholds), "incompatible digital thresholds")
 
     self.assign(self.pullup_capable , self.bidirs.any(lambda x: x.pullup_capable) |
                    self.single_sources.any(lambda x: x.pullup_capable))
@@ -91,8 +90,8 @@ class DigitalLink(CircuitLink):  # can't subclass ElectricalLink because the con
                    self.single_sources.any(lambda x: x.pulldown_capable))
     self.assign(self.has_low_signal_driver, self.single_sources.any(lambda x: x.low_signal_driver))
     self.assign(self.has_high_signal_driver, self.single_sources.any(lambda x: x.high_signal_driver))
-    self.constrain(self.has_low_signal_driver.implies(self.pullup_capable))
-    self.constrain(self.has_high_signal_driver.implies(self.pulldown_capable))
+    self.constrain(self.has_low_signal_driver.implies(self.pullup_capable), "requires pullup capable connection")
+    self.constrain(self.has_high_signal_driver.implies(self.pulldown_capable), "requires pulldown capable connection")
 
 
 class DigitalBase(CircuitPort[DigitalLink]):
@@ -141,17 +140,19 @@ class DigitalSourceBridge(CircuitPortBridge):
   def __init__(self) -> None:
     super().__init__()
 
-    self.outer_port = self.Port(DigitalSource())
-    self.inner_link = self.Port(DigitalSink())
-
-  def contents(self) -> None:
-    super().contents()
+    self.outer_port = self.Port(DigitalSource(voltage_out=RangeExpr(),
+                                              output_thresholds=RangeExpr()))
 
     # Here we ignore the voltage_limits of the inner port, instead relying on the main link to handle it
     # The outer port's current_limits is untouched and should be defined in tte port def.
     # TODO: it's a slightly optimization to handle them here. Should it be done?
     # TODO: or maybe current_limits / voltage_limits shouldn't be a port, but rather a block property?
-    self.assign(self.inner_link.voltage_limits, (-float('inf'), float('inf')))
+    self.inner_link = self.Port(DigitalSink(voltage_limits=RangeExpr.ALL,
+                                            current_draw=RangeExpr(),
+                                            input_thresholds=RangeExpr.EMPTY_DIT))
+
+  def contents(self) -> None:
+    super().contents()
 
     self.assign(self.outer_port.voltage_out, self.inner_link.link().voltage)
     self.assign(self.outer_port.link().current_drawn, self.inner_link.current_draw)
@@ -163,23 +164,22 @@ class DigitalSinkBridge(CircuitPortBridge):
   def __init__(self) -> None:
     super().__init__()
 
-    self.outer_port = self.Port(DigitalSink())
-    self.inner_link = self.Port(DigitalSource())
+    self.outer_port = self.Port(DigitalSink(current_draw=RangeExpr(),
+                                            input_thresholds=RangeExpr()))
+
+    # TODO can we actually define something here? as a pseudoport, this doesn't have limits
+    self.inner_link = self.Port(DigitalSource(current_limits=RangeExpr.ALL,
+                                              voltage_out=RangeExpr(),
+                                              output_thresholds=RangeExpr()))
 
   def contents(self) -> None:
     super().contents()
-
-    # TODO can we actually define something here? as a pseudoport, this doesn't have limits
-    self.assign(self.inner_link.current_limits, (-float('inf'), float('inf')))
 
     self.assign(self.outer_port.current_draw, self.inner_link.link().current_drawn)
     self.assign(self.inner_link.voltage_out, self.outer_port.link().voltage)
 
     self.assign(self.inner_link.output_thresholds, self.outer_port.link().output_thresholds)
-    self.assign(self.outer_port.input_thresholds, (
-      self.inner_link.link().input_low_threshold,
-      self.inner_link.link().input_high_threshold
-    ))
+    self.assign(self.outer_port.input_thresholds, self.inner_link.link().input_thresholds)
 
 
 class DigitalSourceAdapterElectricalSource(CircuitPortAdapter[ElectricalSource]):
@@ -265,6 +265,15 @@ class DigitalBidir(DigitalBase):
       pullup_capable=pullup_capable, pulldown_capable=pulldown_capable
     )
 
+  @staticmethod
+  def empty() -> DigitalBidir:
+    """Returns a new port with no parameters defined (instead of unmodeled defaults),
+     such as if the port is to be exported, including as part of a bundle"""
+    return DigitalBidir(voltage_limits=RangeExpr(), current_draw=RangeExpr(),
+                        voltage_out=RangeExpr(), current_limits=RangeExpr(),
+                        input_thresholds=RangeExpr(), output_thresholds=RangeExpr(),
+                        pullup_capable=BoolExpr(), pulldown_capable=BoolExpr())
+
   def __init__(self, model: Optional[DigitalBidir] = None,
                voltage_limits: RangeLike = Default(RangeExpr.ALL),
                current_draw: RangeLike = Default(RangeExpr.ZERO),
@@ -316,10 +325,7 @@ class DigitalBidirBridge(CircuitPortBridge):
     self.assign(self.outer_port.current_draw, self.inner_link.link().current_drawn)
 
     self.assign(self.outer_port.output_thresholds, self.inner_link.link().output_thresholds)
-    self.assign(self.outer_port.input_thresholds, (
-      self.inner_link.link().input_low_threshold,
-      self.inner_link.link().input_high_threshold
-    ))
+    self.assign(self.outer_port.input_thresholds, self.inner_link.link().input_thresholds)
 
 
 class DigitalSingleSource(DigitalBase):

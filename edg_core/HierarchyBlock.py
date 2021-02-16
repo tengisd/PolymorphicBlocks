@@ -4,11 +4,9 @@ from numbers import Number
 from typing import *
 from itertools import chain
 import collections
-import sys
 
 from . import edgir
 from .Exception import *
-from .Array import Vector
 from .Builder import builder
 from .Blocks import BaseBlock, Link, BlockElaborationState, ConnectedPorts
 from .ConstraintExpr import ConstraintExpr, BoolExpr, FloatExpr, RangeExpr, StringExpr, ParamBinding, AssignBinding
@@ -44,46 +42,48 @@ def init_in_parent(fn: InitType) -> InitType:
         else:
           arg_val = arg_default
 
-        if isinstance(arg_val, ConstraintExpr) and not arg_val._is_bound():
-          assert arg_val.initializer is None, f"in got non-bound {arg_name} but initialized with {arg_val.initializer}"
-          arg_val = None
+        param_name = '(constr)' + arg_name
+        if param_name in self._init_params:  # if previously declared, check it is the prev param and keep as-is
+          prev_val = self._init_params[param_name]
+          assert prev_val is arg_val, f"in {fn}, redefinition of initializer {arg_name}={arg_val} ({id(arg_val)}) over prior {prev_val} ({id(prev_val)})"
+        else:  # not previously declared, create a new constructor parameter
+          if isinstance(arg_val, ConstraintExpr) and not arg_val._is_bound():
+            assert arg_val.initializer is None, f"in got non-bound {arg_name} but initialized with {arg_val.initializer}"
+            arg_val = None
 
-        if isinstance(arg_default, param_types):  # only care about ConstraintExpr-like args
-          # TODO unify w/ ConstraintExpr Union-type
-          # TODO check arg_val type, so a better error message is generated
-          if isinstance(arg_default, (bool, BoolExpr)):
-            param_model: ConstraintExpr = BoolExpr(arg_val)
-          elif isinstance(arg_default, (float, int, FloatExpr)):
-            param_model = FloatExpr(arg_val)
-          elif isinstance(arg_default, RangeExpr) or (isinstance(arg_default, tuple) and
-              isinstance(arg_default[0], float_like_types) and isinstance(arg_default[0], float_like_types)):
-            param_model = RangeExpr(arg_val)
-          elif isinstance(arg_default, (str, StringExpr)):
-            param_model = StringExpr(arg_val)
+          if isinstance(arg_default, param_types):  # only care about ConstraintExpr-like args
+            # TODO unify w/ ConstraintExpr Union-type
+            # TODO check arg_val type, so a better error message is generated
+            if isinstance(arg_default, (bool, BoolExpr)):
+              param_model: ConstraintExpr = BoolExpr(arg_val)
+            elif isinstance(arg_default, (float, int, FloatExpr)):
+              param_model = FloatExpr(arg_val)
+            elif isinstance(arg_default, RangeExpr) or (isinstance(arg_default, tuple) and
+                isinstance(arg_default[0], float_like_types) and isinstance(arg_default[0], float_like_types)):
+              param_model = RangeExpr(arg_val)
+            elif isinstance(arg_default, (str, StringExpr)):
+              param_model = StringExpr(arg_val)
+            else:
+              raise ValueError(f"In {fn}, unknown Constraint-like argument {arg_name}={arg_default} of type {type(arg_default)}")
+          elif isinstance(arg_default, (BaseBlock, BasePort)):
+            raise NotImplementedError(f"in {fn}, argument passing for Block and Port types not implemented: {arg_name}={arg_default}")
+          elif arg_default is inspect._empty:  # type: ignore
+            if (arg_param.kind in (arg_param.VAR_POSITIONAL, arg_param.VAR_KEYWORD)):
+              continue  # TODO in future, recurse into these to make sure they're all set
+            raise NotImplementedError(f"in {fn}, argument {arg_name} with no default, TODO support type-hint inference")
           else:
-            raise ValueError(f"Unknown Constraint-like argument to name={arg_name} with default={arg_default} of type={type(arg_default)}")
+            raise NotImplementedError(f"In {fn}, unrecognized argument to Block: {arg_name}={arg_default} of type {type(arg_default)}")
 
-          # Create new parameter in self
-          # TODO internal initializers (subclass fixing superclass initializers) need to be supported properly
-          param_name = '(constr)' + arg_name
-          assert param_name not in self._init_params, f"in {fn}, redefinition of initializer {arg_name}"
+          # Create new parameter in self, and pass through this one instead of the original
           param_bound = param_model._bind(ParamBinding(self))
           self._init_params[param_name] = param_bound
 
-          # Modify the arguments passed through
           if arg_name in kwargs:
             kwargs[arg_name] = param_bound
           elif arg_index < len(args):
             args[arg_index] = param_bound
           else:
             kwargs[arg_name] = param_bound
-
-        elif isinstance(arg_default, (BaseBlock, BasePort)):
-          raise NotImplementedError(f"argument passing for Block and Port types not implemented: {arg_default}")
-        elif arg_default is inspect._empty:  # type: ignore
-          pass
-        else:
-          raise NotImplementedError(f"unrecognized argument to Block: {arg_default} of type {type(arg_default)}")
     finally:
       builder.pop_to(builder_prev)
 
@@ -186,7 +186,7 @@ class Block(BaseBlock[edgir.HierarchyBlock]):
       *[block._get_ref_map(edgir.localpath_concat(prefix, name)) for (name, block) in self._blocks.items()]
     )
 
-  def _populate_def_proto_hierarchy(self, pb: edgir.HierarchyBlock) -> edgir.HierarchyBlock:
+  def _populate_def_proto_hierarchy(self, pb: edgir.HierarchyBlock, allow_unconnected=False) -> edgir.HierarchyBlock:
     self._blocks.finalize()
     self._connects.finalize()
     self._chains.finalize()
@@ -207,11 +207,12 @@ class Block(BaseBlock[edgir.HierarchyBlock]):
           unconnected_required_ports.append(name + '.' + block._name_of(block_port))
       pb.blocks[name].lib_elem.target.name = block._get_def_name()
 
-    if unconnected_required_ports:
-      required_ports = ', '.join(unconnected_required_ports)
-      raise UnconnectedRequiredPortError(
-        f"In blocks in {type(self)}, "
-        f"required ports {required_ports} not connected")
+    if not allow_unconnected:  # TODO also check avoid-fail-fast as builder option?
+      if unconnected_required_ports:
+        required_ports = ', '.join(unconnected_required_ports)
+        raise UnconnectedRequiredPortError(
+          f"In blocks in {type(self)}, "
+          f"required ports {required_ports} not connected")
 
     # actually generate the links and connects
     link_chain_names = IdentityDict[ConnectedPorts, List[str]]()  # prefer chain name where applicable
@@ -432,8 +433,10 @@ class GeneratorBlock(Block):
   # Generator dependency data
   #
   class GeneratorRecord(NamedTuple):
-    reqs: Tuple[ConstraintExpr, ...]
-    fn_args: Tuple[ConstraintExpr, ...]
+    req_params: Tuple[ConstraintExpr, ...]  # all required params for generator to fire
+    req_ports: Tuple[BasePort, ...]  # all required ports for generator to fire
+    fn_args: Tuple[ConstraintExpr, ...]  # params to unpack for the generator function
+    connect_blocks: Tuple[Block, ...]  # blocks that this generator can connect to
 
   # DEPRECATED - pending experimentation to see if this can be removed
   # This is an older API that has the .get(...) in the genreator function,
@@ -445,65 +448,98 @@ class GeneratorBlock(Block):
     assert getattr(self, fn_name) == fn, f"{self}.{fn_name} did not equal fn {fn}"
 
     assert fn_name not in self._generators, f"redefinition of generator {fn_name}"
-    self._generators[fn_name] = GeneratorBlock.GeneratorRecord(reqs, ())
+    self._generators[fn_name] = GeneratorBlock.GeneratorRecord(reqs, (), (), ())
 
   ConstrGet1 = TypeVar('ConstrGet1', bound=Any)
   ConstrGet2 = TypeVar('ConstrGet2', bound=Any)
   ConstrGet3 = TypeVar('ConstrGet3', bound=Any)
   ConstrGet4 = TypeVar('ConstrGet4', bound=Any)
   ConstrGet5 = TypeVar('ConstrGet5', bound=Any)
+  ConstrGet6 = TypeVar('ConstrGet6', bound=Any)
+  ConstrGet7 = TypeVar('ConstrGet7', bound=Any)
+  ConstrGet8 = TypeVar('ConstrGet8', bound=Any)
 
-  TargetsType = Iterable[Union[BasePort, ConstraintExpr]]
+  TargetsType = Iterable[Union[BasePort, ConstraintExpr, Block]]
 
   @overload
   def generator(self, fn: Callable[[], None],
-                *, targets: TargetsType = []) -> None: ...
+                *, req_ports: Iterable[BasePort] = [], targets: TargetsType = []) -> None: ...
   @overload
   def generator(self, fn: Callable[[ConstrGet1], None],
                 req1: ConstraintExpr[Any, Any, ConstrGet1],
-                *, targets: TargetsType = []) -> None: ...
+                *, req_ports: Iterable[BasePort] = [], targets: TargetsType = []) -> None: ...
   @overload
   def generator(self, fn: Callable[[ConstrGet1, ConstrGet2], None],
-                req1: ConstraintExpr[Any, Any, ConstrGet1],
-                req2: ConstraintExpr[Any, Any, ConstrGet2],
-                *, targets: TargetsType = []) -> None: ...
+                req1: ConstraintExpr[Any, Any, ConstrGet1], req2: ConstraintExpr[Any, Any, ConstrGet2],
+                *, req_ports: Iterable[BasePort] = [], targets: TargetsType = []) -> None: ...
   @overload
   def generator(self, fn: Callable[[ConstrGet1, ConstrGet2, ConstrGet3], None],
-                req1: ConstraintExpr[Any, Any, ConstrGet1],
-                req2: ConstraintExpr[Any, Any, ConstrGet2],
+                req1: ConstraintExpr[Any, Any, ConstrGet1], req2: ConstraintExpr[Any, Any, ConstrGet2],
                 req3: ConstraintExpr[Any, Any, ConstrGet3],
-                *, targets: TargetsType = []) -> None: ...
+                *, req_ports: Iterable[BasePort] = [], targets: TargetsType = []) -> None: ...
   @overload
   def generator(self, fn: Callable[[ConstrGet1, ConstrGet2, ConstrGet3, ConstrGet4], None],
-                req1: ConstraintExpr[Any, Any, ConstrGet1],
-                req2: ConstraintExpr[Any, Any, ConstrGet2],
-                req3: ConstraintExpr[Any, Any, ConstrGet3],
-                req4: ConstraintExpr[Any, Any, ConstrGet4],
-                *, targets: TargetsType = []) -> None: ...
+                req1: ConstraintExpr[Any, Any, ConstrGet1], req2: ConstraintExpr[Any, Any, ConstrGet2],
+                req3: ConstraintExpr[Any, Any, ConstrGet3], req4: ConstraintExpr[Any, Any, ConstrGet4],
+                *, req_ports: Iterable[BasePort] = [], targets: TargetsType = []) -> None: ...
   @overload
-  def generator(self, fn: Callable[[ConstrGet1, ConstrGet2, ConstrGet3, ConstrGet4, ConstrGet5], None],
-                req1: ConstraintExpr[Any, Any, ConstrGet1],
-                req2: ConstraintExpr[Any, Any, ConstrGet2],
-                req3: ConstraintExpr[Any, Any, ConstrGet3],
-                req4: ConstraintExpr[Any, Any, ConstrGet4],
+  def generator(self, fn: Callable[[ConstrGet1, ConstrGet2, ConstrGet3, ConstrGet4,
+                                    ConstrGet5], None],
+                req1: ConstraintExpr[Any, Any, ConstrGet1], req2: ConstraintExpr[Any, Any, ConstrGet2],
+                req3: ConstraintExpr[Any, Any, ConstrGet3], req4: ConstraintExpr[Any, Any, ConstrGet4],
                 req5: ConstraintExpr[Any, Any, ConstrGet5],
-                *, targets: TargetsType = []) -> None: ...
+                *, req_ports: Iterable[BasePort] = [], targets: TargetsType = []) -> None: ...
+  @overload
+  def generator(self, fn: Callable[[ConstrGet1, ConstrGet2, ConstrGet3, ConstrGet4,
+                                    ConstrGet5, ConstrGet6], None],
+                req1: ConstraintExpr[Any, Any, ConstrGet1], req2: ConstraintExpr[Any, Any, ConstrGet2],
+                req3: ConstraintExpr[Any, Any, ConstrGet3], req4: ConstraintExpr[Any, Any, ConstrGet4],
+                req5: ConstraintExpr[Any, Any, ConstrGet5], req6: ConstraintExpr[Any, Any, ConstrGet6],
+                *, req_ports: Iterable[BasePort] = [], targets: TargetsType = []) -> None: ...
+  @overload
+  def generator(self, fn: Callable[[ConstrGet1, ConstrGet2, ConstrGet3, ConstrGet4,
+                                    ConstrGet5, ConstrGet6, ConstrGet7], None],
+                req1: ConstraintExpr[Any, Any, ConstrGet1], req2: ConstraintExpr[Any, Any, ConstrGet2],
+                req3: ConstraintExpr[Any, Any, ConstrGet3], req4: ConstraintExpr[Any, Any, ConstrGet4],
+                req5: ConstraintExpr[Any, Any, ConstrGet5], req6: ConstraintExpr[Any, Any, ConstrGet6],
+                req7: ConstraintExpr[Any, Any, ConstrGet7],
+                *, req_ports: Iterable[BasePort] = [], targets: TargetsType = []) -> None: ...
+  @overload
+  def generator(self, fn: Callable[[ConstrGet1, ConstrGet2, ConstrGet3, ConstrGet4,
+                                    ConstrGet5, ConstrGet6, ConstrGet7, ConstrGet8], None],
+                req1: ConstraintExpr[Any, Any, ConstrGet1], req2: ConstraintExpr[Any, Any, ConstrGet2],
+                req3: ConstraintExpr[Any, Any, ConstrGet3], req4: ConstraintExpr[Any, Any, ConstrGet4],
+                req5: ConstraintExpr[Any, Any, ConstrGet5], req6: ConstraintExpr[Any, Any, ConstrGet6],
+                req7: ConstraintExpr[Any, Any, ConstrGet7], req8: ConstraintExpr[Any, Any, ConstrGet8],
+                *, req_ports: Iterable[BasePort] = [], targets: TargetsType = []) -> None: ...
 
   # TODO don't ignore the type and fix so the typer understands the above are subsumed by this
-  def generator(self, fn: Callable[..., None], *reqs: ConstraintExpr, targets: TargetsType = []) -> None:  # type: ignore
+  def generator(self, fn: Callable[..., None], *reqs: ConstraintExpr,  # type: ignore
+                req_ports: Iterable[BasePort] = [], targets: TargetsType = []) -> None:
+    """
+    Registers a generator function
+    :param fn: function (of self) to invoke, where the parameter list lines up with reqs
+    :param reqs: required parameters, the value of which is made available to the generator
+    :param req_ports: required ports, which can have their .is_connected() and .link().name() value obtained
+    :param targets: list of ports and blocks the generator may connect to, to avoid generating initializers
+    """
     assert callable(fn), f"fn {fn} must be a method (callable)"
     fn_name = fn.__name__
     assert hasattr(self, fn_name), f"{self} does not contain {fn_name}"
     assert getattr(self, fn_name) == fn, f"{self}.{fn_name} did not equal fn {fn}"
 
     assert fn_name not in self._generators, f"redefinition of generator {fn_name}"
-    self._generators[fn_name] = GeneratorBlock.GeneratorRecord(reqs, reqs)
+    target_blocks = [target for target in targets if isinstance(target, Block)]
+    self._generators[fn_name] = GeneratorBlock.GeneratorRecord(reqs, tuple(req_ports), reqs,
+                                                               tuple(target_blocks))
 
     for target in targets:
       if isinstance(target, BasePort):
         self._generator_target_ports.add(target)
       elif isinstance(target, ConstraintExpr):
         self._generator_target_params.add(target)
+      elif isinstance(target, Block):
+        pass  # written into the GeneratorRecord instead for the compiler
       else:
         raise TypeError(f"unknown generator target type {target}")
 
@@ -558,33 +594,35 @@ class GeneratorBlock(Block):
       assert issubclass(cls, Block)
 
     pb = edgir.HierarchyBlock()
-    if self._elaboration_state == BlockElaborationState.post_generate:  # don't write contents before generate
-      pb = self._populate_def_proto_hierarchy(pb)  # specifically generate connect statements first TODO why?
-      pb = self._populate_def_proto_block_base(pb)
-      pb = self._populate_def_proto_block_contents(pb)
-      pb = self._populate_def_proto_param_init(pb, IdentitySet(*chain(self._init_params.values(),
-                                                                      self._generator_target_params)))
-      pb = self._populate_def_proto_port_init(pb, IdentitySet(*chain(self._connected_ports(),
-                                                                     self._generator_target_ports)))
-    else:
-      pb = self._populate_def_proto_block_base(pb)
-      pb = self._populate_def_proto_block_contents(pb)  # constraints need to be written and propagated
-      pb = self._populate_def_proto_param_init(pb, IdentitySet(*chain(self._init_params.values(),
-                                                                      self._generator_target_params)))
-      pb = self._populate_def_proto_port_init(pb, IdentitySet(*chain(self._connected_ports(),
-                                                                     self._generator_target_ports)))
+
+    pb = self._populate_def_proto_hierarchy(pb, allow_unconnected=True)  # specifically generate connect statements first TODO why?
+    pb = self._populate_def_proto_block_base(pb)
+    pb = self._populate_def_proto_block_contents(pb)
+    pb = self._populate_def_proto_param_init(pb, IdentitySet(*chain(self._init_params.values(),
+                                                                    self._generator_target_params)))
+    pb = self._populate_def_proto_port_init(pb, IdentitySet(*chain(self._connected_ports(),
+                                                                   self._generator_target_ports)))
+
+    if self._elaboration_state != BlockElaborationState.post_generate:  # don't write generators if invoking the generator
       pb = self._populate_def_proto_block_generator(pb)
+
     return pb
 
   def _populate_def_proto_block_generator(self, pb: edgir.HierarchyBlock) -> edgir.HierarchyBlock:
     assert self._generators, f"{self} did not define any generator functions"
 
     ref_map = self._get_ref_map(edgir.LocalPath())
+
     for (name, record) in self._generators.items():
-      pb.generators[name].fn = name
-      conditions = pb.generators[name].conditions.add()
-      for req in record.reqs:
-        conditions.prereqs.add().CopyFrom(ref_map[req])
+      pb.generators[name]  # even if rest of the fields are empty, make sure to create a record
+      # TODO maybe there should be done data here?
+      for req_param in record.req_params:
+        pb.generators[name].required_params.add().CopyFrom(ref_map[req_param])
+      for req_port in record.req_ports:
+        pb.generators[name].required_ports.add().CopyFrom(ref_map[req_port])
+      for connect_block in record.connect_blocks:
+        pb.generators[name].connected_blocks.add().CopyFrom(ref_map[connect_block])
+
     return pb
 
   def _parse_param_values(self, values: Iterable[Tuple[edgir.LocalPath, edgir.LitTypes]]) -> None:
@@ -601,8 +639,15 @@ class GeneratorBlock(Block):
                               generate_values: Iterable[Tuple[edgir.LocalPath, edgir.LitTypes]]) -> edgir.HierarchyBlock:
     assert self._elaboration_state == BlockElaborationState.post_init  # TODO dedup w/ elaborated_def_to_proto
     self._elaboration_state = BlockElaborationState.contents
+
     self.contents()
+
     self._elaboration_state = BlockElaborationState.generate
+
+    for (name, port) in self._ports.items():
+      # TODO cleaner, oddly-stateful, detection of connected_link
+      if isinstance(port, Port):
+        port.link()  # lazy-initialize connected_link refs so it's ready for params
     self._parse_param_values(generate_values)
 
     # TODO: support ValueExpr, perhaps by ConstraintExpr matching or eager conversion to ValueExpr
@@ -612,7 +657,9 @@ class GeneratorBlock(Block):
 
     fn = getattr(self, generate_fn_name)
     fn(*fn_args)
+
     self._elaboration_state = BlockElaborationState.post_generate
+
     return self._def_to_proto()
 
   def generate(self):

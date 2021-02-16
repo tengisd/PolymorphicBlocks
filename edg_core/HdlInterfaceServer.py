@@ -1,6 +1,7 @@
 from types import ModuleType
-from typing import Generator, Optional, Set, Dict, Type, cast, List
+from typing import Generator, Optional, Set, Dict, Type, cast, List, Any
 
+import builtins
 import importlib
 import inspect
 import traceback
@@ -14,31 +15,21 @@ from .DesignTop import DesignTop
 from .Ports import Port, Bundle
 
 
-# Cacheing layer around library elements that also provides LibraryPath to class
-# (instead of from module and class path) resolution.
+# Index of module(s) recursively, and providing protobuf LibraryPath to class resolution.
 class LibraryElementResolver():
   def __init__(self):
     self.seen_modules: Set[ModuleType] = set()
-    self.module_contains: Dict[str, Set[str]] = {}
     self.lib_class_map: Dict[str, Type[LibraryElement]] = {}
 
-  def load_module(self, module_name: str) -> None:
+    # Every time we reload, we need to get a fresh handle to the relevant base classes
+    self.LibraryElementType = getattr(importlib.import_module("edg_core"), "LibraryElement")
+    self.PortType = getattr(importlib.import_module("edg_core"), "Port")
+
+  def load_module(self, module: ModuleType) -> None:
     """Loads a module and indexes the contained library elements so they can be accesed by LibraryPath.
     Avoids re-loading previously loaded modules with cacheing.
     """
-    self._search_module(importlib.import_module(module_name))
-
-  def discard_module(self, module_name: str) -> Set[str]:
-    discarded = self.module_contains.get(module_name, set())
-    for discard in discarded:
-      self.lib_class_map.pop(discard, None)
-    module = importlib.import_module(module_name)
-    if module in self.seen_modules:  # TODO better discard behavior for never seen module
-      self.seen_modules.remove(module)
-    self.module_contains.pop(module_name, None)
-    importlib.reload(module)
     self._search_module(module)
-    return discarded
 
   def _search_module(self, module: ModuleType) -> None:
     # avoid repeated work and re-indexing modules
@@ -51,47 +42,84 @@ class LibraryElementResolver():
     for (name, member) in inspect.getmembers(module):
       if inspect.ismodule(member):
         self._search_module(member)
-      if inspect.isclass(member) and issubclass(member, LibraryElement) \
+      if inspect.isclass(member) and issubclass(member, self.LibraryElementType) \
           and (member, 'non_library') not in member._elt_properties:
         name = member._static_def_name()
         if name in self.lib_class_map:
           assert self.lib_class_map[name] == member, f"different redefinition of {name} in {module.__name__}"
         else:  # for ports, recurse into links and stuff
-          if issubclass(member, Port):  # TODO for some reason, Links not in __init__ are sometimes not found
-            obj = member()  # TODO can these be clss definitions?
+          if issubclass(member, self.PortType):  # TODO for some reason, Links not in __init__ are sometimes not found
+            obj = member()  # TODO can these be class definitions?
             if hasattr(obj, 'link_type'):
               self._search_module(importlib.import_module(obj.link_type.__module__))
 
         self.lib_class_map[name] = member
-        self.module_contains.setdefault(member.__module__, set()).add(name)
 
   def class_from_path(self, path: edgir.LibraryPath) -> Optional[Type[LibraryElement]]:
     """Assuming modules have been loaded, retrieves a LibraryElement class by LibraryPath."""
     dict_key = path.target.name
-    if dict_key not in self.lib_class_map:
-      return None
-    else:
-      return self.lib_class_map[dict_key]
+    return self.lib_class_map.get(dict_key, None)
 
+
+# Module reloading solution from http://pyunit.sourceforge.net/notes/reloading.html
+class RollbackImporter:
+  def __init__(self) -> None:
+    "Creates an instance and installs as the global importer"
+    self.previousModules: Set[ModuleType] = set(sys.modules.copy().values())
+    self.realImport = builtins.__import__
+    builtins.__import__ = self._import
+    self.newModules: List[ModuleType] = []
+
+  def _import(self, name: str, *args, **kwargs) -> ModuleType:
+    module = self.realImport(name, *args, **kwargs)
+    if module not in self.newModules \
+        and module.__name__ not in sys.builtin_module_names \
+        and hasattr(module, '__file__') \
+        and module.__file__ \
+        and module not in self.previousModules \
+        and 'Python37-32' not in module.__file__ \
+        and 'site-packages' not in module.__file__ \
+        and 'edg_core' not in module.__file__:  # don't rollback internals, bad things happen
+      self.newModules.append(module)
+
+    return module
+
+  def clear(self) -> None:
+    for module in self.newModules:
+      importlib.reload(module)
 
 class HdlInterface(edgrpc.HdlInterfaceServicer):  # type: ignore
-  def __init__(self, library: LibraryElementResolver, *, verbose: bool = False):
-    self.library = library
+  def __init__(self, *, verbose: bool = False, rollback: Optional[Any] = None):
+    self.library = LibraryElementResolver()  # dummy empty resolver
     self.verbose = verbose
+    self.rollback = rollback
 
-  def LibraryElementsInModule(self, request: edgrpc.ModuleName, context) -> \
-      Generator[edgir.LibraryPath, None, None]:
-    raise NotImplementedError
-
-  def ClearCached(self, request: edgrpc.ModuleName, context) -> Generator[edgir.LibraryPath, None, None]:
-    discarded = self.library.discard_module(request.name)
+  def ReloadModule(self, request: edgrpc.ModuleName, context) -> Generator[edgir.LibraryPath, None, None]:
     if self.verbose:
-      print(f"ClearCached({request.name}) -> None (discarding {len(discarded)})")
-    for discard in discarded:
-      pb = edgir.LibraryPath()
-      pb.target.name = discard
+      print(f"ReloadModule({request.name}) -> ", end='', flush=True)
+
+    try:
+      # nuke it from orbit, because we really don't know how to do better right now
+      self.library = LibraryElementResolver()  # clear old the old resolver
+      if self.rollback is not None:
+        self.rollback.clear()
+
+      module = importlib.import_module(request.name)
+      self.library.load_module(module)
+      if self.rollback is not None:
+        self.rollback.newModules.append(module)
+
+      if self.verbose:
+        print(f"None (indexed {len(self.library.lib_class_map)})")
+      for indexed in self.library.lib_class_map.keys():
+        pb = edgir.LibraryPath()
+        pb.target.name = indexed
+
       yield pb
-    self.library.load_module(request.name)
+    except BaseException as e:
+      if self.verbose:
+        print(f"Error {e}")
+      return
 
   @staticmethod
   def _elaborate_class(elt_cls: Type[LibraryElement]) -> edgir.Library.NS.Val:
@@ -113,8 +141,8 @@ class HdlInterface(edgrpc.HdlInterfaceServicer):  # type: ignore
       raise RuntimeError(f"didn't match type of library element {elt_cls}")
 
   def GetLibraryElement(self, request: edgrpc.LibraryRequest, context) -> edgrpc.LibraryResponse:
-    for module_name in request.modules:  # TODO: this isn't completely hermetic in terms of library searching
-      self.library.load_module(module_name)
+    if self.verbose:
+      print(f"GetLibraryElement({request.element.target.name}) -> ", end='', flush=True)
 
     response = edgrpc.LibraryResponse()
     try:
@@ -132,17 +160,17 @@ class HdlInterface(edgrpc.HdlInterfaceServicer):  # type: ignore
 
     if self.verbose:
       if response.HasField('error'):
-        print(f"GetLibraryElement([{', '.join(request.modules)}], {request.element.target.name}) -> Error {response.error}")
+        print(f"Error {response.error}")
       elif response.HasField('refinements'):
-        print(f"GetLibraryElement([{', '.join(request.modules)}], {request.element.target.name}) -> ... (w/ refinements)")
+        print(f"(elt, w/ refinements)")
       else:
-        print(f"GetLibraryElement([{', '.join(request.modules)}], {request.element.target.name}) -> ...")
+        print(f"(elt)")
 
     return response
 
   def ElaborateGenerator(self, request: edgrpc.GeneratorRequest, context) -> edgrpc.GeneratorResponse:
-    for module_name in request.modules:  # TODO: this isn't completely hermetic in terms of library searching
-      self.library.load_module(module_name)
+    if self.verbose:
+      print(f"ElaborateGenerator({request.element.target.name}) -> ", end='', flush=True)
 
     response = edgrpc.GeneratorResponse()
     try:
@@ -160,14 +188,15 @@ class HdlInterface(edgrpc.HdlInterfaceServicer):  # type: ignore
         replace_superclass=False,
         generate_fn_name=request.fn, generate_values=generator_values))
     except BaseException as e:
-      traceback.print_exc()
-      print(f"while serving generator request for {request.element.target.name}")
+      if self.verbose:
+        traceback.print_exc()
+        print(f"while serving generator request for {request.element.target.name}")
       response.error = str(e)
 
     if self.verbose:
       if response.HasField('error'):
-        print(f"ElaborateGenerator([{', '.join(request.modules)}], {request.element.target.name}) -> Error {response.error}")
+        print(f"Error {response.error}")
       else:
-        print(f"ElaborateGenerator([{', '.join(request.modules)}], {request.element.target.name}) -> ...")
+        print(f"(generated)")
 
     return response

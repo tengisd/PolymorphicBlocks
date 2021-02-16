@@ -1,5 +1,6 @@
 from typing import *
 
+from itertools import chain
 from electronics_abstract_parts import *
 
 
@@ -80,9 +81,9 @@ class Nucleo_F303k8(Microcontroller, CircuitBlock, AssignablePinBlock):  # TODO 
 
     # TODO model IO draw - need internal source block?
 
-    # TODO principled new-style generator for pin assign / hinting params
-    # NOTE this only (maybe?) works b/c of compiler implementation specifics (assigns in parent processed first)
-    self.generator(self.pin_assign)  # TODO pass in connected blocks
+    self.generator(self.pin_assign,
+                   req_ports=list(chain(self.digital.values(), self.adc.values(), self.dac.values(),
+                                        [self.uart_0, self.spi_0, self.can_0])))
 
   def pin_assign(self) -> None:
     # Note: application circuit at LPC15XX 14.6, Figure 49
