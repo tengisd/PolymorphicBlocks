@@ -1,5 +1,4 @@
 from electronics_abstract_parts import *
-from .Opamp_Mcp6001 import Mcp6001
 
 
 class Supercap(DiscreteComponent, CircuitBlock):  # TODO actually model supercaps and parts selection
@@ -21,7 +20,7 @@ class Supercap(DiscreteComponent, CircuitBlock):  # TODO actually model supercap
     )
 
 
-class BufferedSupply(PowerConditioner, GeneratorBlock):
+class BufferedSupply(PowerConditioner):
   """Implements a current limiting source with an opamp for charging a supercap, and a Vf-limited diode
   for discharging
 
@@ -41,14 +40,11 @@ class BufferedSupply(PowerConditioner, GeneratorBlock):
     self.constrain(self.pwr.current_draw.within(self.pwr_out.link().current_drawn +
                                                 (0, self.charging_current.upper()) +
                                                 (0, 0.05)))  # TODO nonhacky bounds on opamp/sense resistor current draw
-    self.sc_out = self.Port(ElectricalSource(  # TODO This should be done with a power merge block
-      voltage_out=self.pwr.link().voltage
-    ), optional=True)
+    self.sc_out = self.Port(ElectricalSource(), optional=True)
     self.gnd = self.Port(Ground(), [Common])
 
-  def generate(self) -> None:
-    max_in_voltage = self.get(self.pwr.link().voltage.upper())
-    max_charge_current = self.get(self.charging_current.upper())
+    max_in_voltage = self.pwr.link().voltage.upper()
+    max_charge_current = self.charging_current.upper()
 
     # Upstream power domain
     # TODO improve connect modeling everywhere
@@ -58,13 +54,14 @@ class BufferedSupply(PowerConditioner, GeneratorBlock):
     ) as imp:
       self.sense = self.Block(Resistor(  # TODO replace with SeriesResistor/CurrentSenseResistor - that propagates current
         resistance=self.sense_resistance,
-        power=max_charge_current * max_charge_current * self.get(self.sense_resistance.upper())
+        power=max_charge_current * max_charge_current * self.sense_resistance.upper()
       ))
-      self.connect(self.pwr, self.sense.a.as_electrical_sink(current_draw=(0, max_charge_current)*Amp))
+      self.connect(self.pwr, self.sense.a.as_electrical_sink(
+        current_draw=(0, max_charge_current)))
 
       self.fet = self.Block(PFet(
         drain_voltage=(0, max_in_voltage), drain_current=(0, max_charge_current),
-        gate_voltage=(self.get(self.pwr.link().voltage.lower()), max_in_voltage),
+        gate_voltage=(self.pwr.link().voltage.lower(), max_in_voltage),
         rds_on=(0, 0.5)*Ohm,  # TODO kind of arbitrary
         gate_charge=(0, float('inf')),
         power=(0, max_in_voltage * max_charge_current)
@@ -75,7 +72,10 @@ class BufferedSupply(PowerConditioner, GeneratorBlock):
         reverse_voltage=(0, max_in_voltage), current=self.charging_current, voltage_drop=self.voltage_drop,
         reverse_recovery_time=(0, float('inf'))
       ))
-      self.connect(self.diode.anode.as_electrical_sink(), self.fet.drain.as_electrical_source(), self.sc_out)
+      self.connect(self.diode.anode.as_electrical_sink(),
+                   self.fet.drain.as_electrical_source(
+                     voltage_out=self.pwr.link().voltage),
+                   self.sc_out)
 
       self.pwr_out_merge = self.Block(MergedElectricalSource())
       self.connect(self.pwr_out_merge.sink1, self.pwr)
@@ -85,15 +85,15 @@ class BufferedSupply(PowerConditioner, GeneratorBlock):
       self.connect(self.pwr_out_merge.source, self.pwr_out)
 
       # TODO check if this tolerance stackup is stacking in the right direction... it might not
-      low_sense_volt_diff = self.get(self.charging_current.lower()) * self.get(self.sense_resistance.lower())
-      high_sense_volt_diff = self.get(self.charging_current.upper()) * self.get(self.sense_resistance.upper())
-      low_sense_volt = self.get(self.pwr.link().voltage.lower()) - high_sense_volt_diff
-      high_sense_volt = self.get(self.pwr.link().voltage.upper()) - low_sense_volt_diff
+      low_sense_volt_diff = self.charging_current.lower() * self.sense_resistance.lower()
+      high_sense_volt_diff = self.charging_current.upper() * self.sense_resistance.upper()
+      low_sense_volt = self.pwr.link().voltage.lower() - high_sense_volt_diff
+      high_sense_volt = self.pwr.link().voltage.upper() - low_sense_volt_diff
 
       self.set = imp.Block(VoltageDivider(output_voltage=(low_sense_volt, high_sense_volt), impedance=(1, 10) * kOhm))
-      self.connect(self.set.pwr, self.pwr)  # TODO use chain
+      self.connect(self.set.input, self.pwr)  # TODO use chain
       self.amp = imp.Block(Opamp())
-      self.connect(self.set.out, self.amp.inp)
+      self.connect(self.set.output, self.amp.inp)
       self.connect(self.amp.inn, self.sense.b.as_analog_source(
         voltage_out=(0, self.pwr.link().voltage.upper()),
         impedance=0*Ohm(tol=0)

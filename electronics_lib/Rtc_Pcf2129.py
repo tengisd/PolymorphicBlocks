@@ -68,19 +68,19 @@ class Pcf2129(RealtimeClock, CircuitBlock):
     self.ic = self.Block(Pcf2129_Device())
     self.pwr = self.Port(ElectricalSink(), [Power])
     self.pwr_bat = self.Export(self.ic.pwr_bat)
-    self.gnd = self.Export(self.ic.gnd)
+    self.gnd = self.Export(self.ic.gnd, [Common])
 
     self.spi = self.Export(self.ic.spi)
     self.cs = self.Export(self.ic.cs)
-    self.clkout = self.Export(self.ic.clkout)
-    self.int = self.Export(self.ic.int)
+    self.clkout = self.Export(self.ic.clkout, optional=True)
+    self.int = self.Export(self.ic.int, optional=True)
 
   def contents(self):
     super().contents()
 
     (self.vdd_res, ), _ = self.chain(
       self.pwr,
-      self.Block(SeriesPowerResistor(330*Ohm(tol=0.01), (0, 800)*uAmp)),
+      self.Block(SeriesPowerResistor(330*Ohm(tol=0.05), (0, 800)*uAmp)),
       self.ic.pwr)
 
     with self.implicit_connect(

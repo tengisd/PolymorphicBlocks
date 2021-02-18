@@ -1,8 +1,7 @@
-import os
 import unittest
-import sys
 
 from edg import *
+from .ExampleTestUtils import run_test
 
 
 class LightsConnector(Connector, CircuitBlock):
@@ -62,7 +61,7 @@ class LightsDriver(Block):
         self.connect(driver.output, self.conn.out[i])
 
 
-class TestHighSwitch(CircuitBlock):
+class TestHighSwitch(BoardTop):
   def contents(self) -> None:
     super().contents()
 
@@ -92,6 +91,12 @@ class TestHighSwitch(CircuitBlock):
       (self.crystal, ), _ = self.chain(self.mcu.xtal, imp.Block(OscillatorCrystal(frequency=12 * MHertz(tol=0.005))))  # TODO can we not specify this and instead infer from MCU specs?
 
       (self.can, ), _ = self.chain(self.mcu.new_io(CanControllerPort, pin=[43, 44]), imp.Block(CalSolCanBlock()))
+
+      # TODO need proper support for exported unconnected ports
+      self.can_gnd_load = self.Block(ElectricalLoad())
+      self.connect(self.can.can_gnd, self.can_gnd_load.pwr)
+      self.can_pwr_load = self.Block(ElectricalLoad())
+      self.connect(self.can.can_pwr, self.can_pwr_load.pwr)
 
       (self.vsense, ), _ = self.chain(
         self.pwr_conn.pwr,
@@ -142,7 +147,4 @@ class TestHighSwitch(CircuitBlock):
 
 class HighSwitchTestCase(unittest.TestCase):
   def test_design(self) -> None:
-    ElectronicsDriver([sys.modules[__name__]]).generate_write_block(
-      TestHighSwitch(),
-      os.path.splitext(__file__)[0]
-    )
+    run_test(TestHighSwitch)

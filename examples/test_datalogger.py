@@ -1,11 +1,10 @@
-import os
 import unittest
 
 from edg import *
-from edg import TransformUtil as tfu
+from .ExampleTestUtils import run_test
 
 
-class TestDatalogger(CircuitBlock):
+class TestDatalogger(BoardTop):
   def contents(self) -> None:
     super().contents()
 
@@ -30,7 +29,7 @@ class TestDatalogger(CircuitBlock):
     ) as imp:
       (self.pwr_5v,), _ = self.chain(
         self.pwr_conn.pwr,
-        imp.Block(BuckConverter(output_voltage=(4.85, 5.35)*Volt)),
+        imp.Block(BuckConverter(output_voltage=(4.85, 5.4)*Volt)),
         self.pwr_5v_merge.sink2
       )
 
@@ -61,6 +60,12 @@ class TestDatalogger(CircuitBlock):
       self.connect(self.mcu.usb_0, self.usb_conn.usb)
 
       (self.can, ), _ = self.chain(self.mcu.new_io(CanControllerPort, pin=[51, 53]), imp.Block(CalSolCanBlock()))
+
+      # TODO need proper support for exported unconnected ports
+      self.can_gnd_load = self.Block(ElectricalLoad())
+      self.connect(self.can.can_gnd, self.can_gnd_load.pwr)
+      self.can_pwr_load = self.Block(ElectricalLoad())
+      self.connect(self.can.can_pwr, self.can_pwr_load.pwr)
 
       # mcu_i2c = self.mcu.new_io(I2cMaster)  # no devices, ignored for now
       # self.i2c_pullup = imp.Block(I2cPullup())
@@ -136,15 +141,16 @@ class TestDatalogger(CircuitBlock):
     self.leadfree = self.Block(LeadFreeIndicator())
     self.id = self.Block(IdDots4())
 
+  def refinements(self) -> Refinements:
+    return super().refinements() + Refinements(
+      instance_refinements=[
+        (['pwr_5v'], Tps561201),
+        (['pwr_3v3'], Ldl1117),
+        (['buffer', 'amp'], Mcp6001),
+      ]
+    )
+
 
 class DataloggerTestCase(unittest.TestCase):
   def test_design(self) -> None:
-    ElectronicsDriver().generate_write_block(
-      TestDatalogger(),
-      os.path.splitext(__file__)[0],
-      instance_refinements={
-        tfu.Path.empty().append_block('pwr_5v'): Tps561201,
-        tfu.Path.empty().append_block('pwr_3v3'): Ldl1117,
-        tfu.Path.empty().append_block('buffer').append_block('amp'): Mcp6001,
-      }
-    )
+    run_test(TestDatalogger)
