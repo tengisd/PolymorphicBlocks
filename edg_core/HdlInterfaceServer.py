@@ -40,18 +40,23 @@ class LibraryElementResolver():
     self.seen_modules.add(module)
 
     for (name, member) in inspect.getmembers(module):
-      if inspect.ismodule(member):
+      if inspect.ismodule(member):  # recurse into visible modules
         self._search_module(member)
+
       if inspect.isclass(member) and issubclass(member, self.LibraryElementType) \
-          and (member, 'non_library') not in member._elt_properties:
+          and (member, 'non_library') not in member._elt_properties:  # process elements
         name = member._static_def_name()
         if name in self.lib_class_map:
           assert self.lib_class_map[name] == member, f"different redefinition of {name} in {module.__name__}"
-        else:  # for ports, recurse into links and stuff
-          if issubclass(member, self.PortType):  # TODO for some reason, Links not in __init__ are sometimes not found
-            obj = member()  # TODO can these be class definitions?
-            if hasattr(obj, 'link_type'):
-              self._search_module(importlib.import_module(obj.link_type.__module__))
+          continue  # don't need to re-index
+
+        for mro in member.mro():
+          self._search_module(importlib.import_module(mro.__module__))
+
+        if issubclass(member, self.PortType):  # TODO for some reason, Links not in __init__ are sometimes not found
+          obj = member()  # TODO can these be class definitions?
+          if hasattr(obj, 'link_type'):
+            self._search_module(importlib.import_module(obj.link_type.__module__))
 
         self.lib_class_map[name] = member
 
@@ -85,8 +90,15 @@ class RollbackImporter:
     return module
 
   def clear(self) -> None:
+    inverse_modules = {module: name for name, module in sys.modules.items()}
+    deleted_modules = []
     for module in self.newModules:
-      importlib.reload(module)
+      if module in inverse_modules:
+        name = inverse_modules[module]
+        if name in sys.modules:
+          del sys.modules[name]
+          deleted_modules.append(module)
+    self.newModules = []
 
 class HdlInterface(edgrpc.HdlInterfaceServicer):  # type: ignore
   def __init__(self, *, verbose: bool = False, rollback: Optional[Any] = None):
@@ -114,8 +126,7 @@ class HdlInterface(edgrpc.HdlInterfaceServicer):  # type: ignore
       for indexed in self.library.lib_class_map.keys():
         pb = edgir.LibraryPath()
         pb.target.name = indexed
-
-      yield pb
+        yield pb
     except BaseException as e:
       if self.verbose:
         print(f"Error {e}")

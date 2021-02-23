@@ -339,33 +339,33 @@ class Lpc1549(Microcontroller, AssignablePinBlock):  # TODO refactor with _Devic
     # TODO model current flows from digital ports
     self.digital = ElementDict[DigitalBidir]()
     for i in range(20):
-      self.digital[i] = self.Port(DigitalBidir.empty(), optional=True)
+      self.digital[i] = self.Port(DigitalBidir(), optional=True)
       self._add_assignable_io(self.digital[i])
 
     self.adc = ElementDict[AnalogSink]()
     for i in range(10):
-      self.adc[i] = self.Port(AnalogSink.empty(), optional=True)
+      self.adc[i] = self.Port(AnalogSink(), optional=True)
       self._add_assignable_io(self.adc[i])
 
     self.dac = ElementDict[AnalogSource]()
     for i in range(1):
-      self.dac[i] = self.Port(AnalogSource.empty(), optional=True)
+      self.dac[i] = self.Port(AnalogSource(), optional=True)
       self._add_assignable_io(self.dac[i])
 
     self.uart = ElementDict[UartPort]()
     for i in range(3):
-      self.uart[i] = self.Port(UartPort(DigitalBidir.empty()), optional=True)
+      self.uart[i] = self.Port(UartPort(), optional=True)
       self._add_assignable_io(self.uart[i])
 
     self.spi = ElementDict[SpiMaster]()
     for i in range(2):
-      self.spi[i] = self.Port(SpiMaster(DigitalBidir.empty()), optional=True)
+      self.spi[i] = self.Port(SpiMaster(), optional=True)
       self._add_assignable_io(self.spi[i])
 
-    self.can_0 = self.Port(CanControllerPort(DigitalBidir.empty()), optional=True)
+    self.can_0 = self.Port(CanControllerPort(), optional=True)
     self._add_assignable_io(self.can_0)
 
-    self.i2c_0 = self.Port(I2cMaster(DigitalBidir.empty()), optional=True)
+    self.i2c_0 = self.Port(I2cMaster(), optional=True)
     self.connect(self.i2c_0, self.ic.i2c_0)
     # self._add_assignable_io(self.i2c_0)  # TODO conflicts with pin assign
 
@@ -384,9 +384,9 @@ class Lpc1549(Microcontroller, AssignablePinBlock):  # TODO refactor with _Devic
       current_draw=self._io_draw
     ))
     self.connect(self.pwr, self.io_draw.pwr)
-    self.constrain(self.pwr.current_draw.within(self._io_draw + (0, 19)*mAmp))  # TODO fast prop so we can bound it before generation
+    self.require(self.pwr.current_draw.within(self._io_draw + (0, 19)*mAmp))
 
-    self.generator(self.pin_assign,
+    self.generator(self.pin_assign, self.pin_assigns,
                    req_ports=chain(self.digital.values(),
                                    self.adc.values(), self.dac.values(),
                                    self.uart.values(), self.spi.values(),
@@ -401,8 +401,8 @@ class Lpc1549(Microcontroller, AssignablePinBlock):  # TODO refactor with _Devic
     #
     # Reference Circuit Block
     #
-    self.constrain(self.ic.IRC_FREQUENCY.within(self.frequency) | self.xtal.is_connected(),
-                   "requested frequency out of internal RC range")  # TODO configure clock dividers?
+    self.require(self.ic.IRC_FREQUENCY.within(self.frequency) | self.xtal.is_connected(),
+                 "requested frequency out of internal RC range")  # TODO configure clock dividers?
 
     # TODO associate capacitors with a particular Vdd, Vss pin
     self.pwr_cap = ElementDict[DecouplingCapacitor]()
@@ -445,7 +445,7 @@ class Lpc1549(Microcontroller, AssignablePinBlock):  # TODO refactor with _Devic
     # TODO capacitive divider in CLKIN mode; in XO mode see external load capacitors table, see LPC15XX 14.3
 
 
-  def pin_assign(self) -> None:
+  def pin_assign(self, pin_assigns_str: str) -> None:
     #
     # Pin Assignment Block
     #
@@ -458,7 +458,7 @@ class Lpc1549(Microcontroller, AssignablePinBlock):  # TODO refactor with _Devic
                    self.ic.DIO0_PINS + self.ic.DIO1_PINS),
     ).assign(
       [port for port in self._all_assignable_ios if self.get(port.is_connected())],
-      self._get_suggested_pin_maps())
+      self._get_suggested_pin_maps(pin_assigns_str))
 
     #
     # IO models

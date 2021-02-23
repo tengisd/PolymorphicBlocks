@@ -115,17 +115,25 @@ class PythonInterfaceLibrary(py: PythonInterface) extends Library {
     pyRefreshedElements
   }
 
-  private def fetchEltIfNeeded(path: ref.LibraryPath): Unit = {
-    if (!elts.contains(path)) {
-      py.libraryRequest(path) match {
-        case Errorable.Success((elem, None)) =>
+  def getLibrary(path: ref.LibraryPath): Errorable[schema.Library.NS.Val.Type] = {
+    elts.get(path) match {
+      case Some(value) => Errorable.Success(value)
+      case None => py.libraryRequest(path) match { // not in cache, fetch from Python
+        case Errorable.Success((elem, refinementsOpt)) =>
           elts.put(path, elem.`type`)
-        case Errorable.Success((elem, Some(refinements))) =>
-          elts.put(path, elem.`type`)
-          eltsRefinements.put(path, refinements)
-        case Errorable.Error(err) =>
-          // TODO better error handling and passing
+          refinementsOpt.foreach {
+            eltsRefinements.put(path, _)
+          }
+          Errorable.Success(elem.`type`)
+        case err @ Errorable.Error(_) => err
       }
+    }
+  }
+
+  private def getLibraryPartialMapped[T](path: ref.LibraryPath, expectedType: String)
+                                        (mapping: PartialFunction[schema.Library.NS.Val.Type, T]): Errorable[T] = {
+    getLibrary(path).flatMap(s"Library element at $path expected type $expectedType") { value =>
+      mapping.lift.apply(value)
     }
   }
 
@@ -144,45 +152,33 @@ class PythonInterfaceLibrary(py: PythonInterface) extends Library {
     case (path, schema.Library.NS.Val.Type.Link(link)) => (path, link)
   }.toMap
 
-  override def getBlock(path: ref.LibraryPath): elem.HierarchyBlock = {
-    fetchEltIfNeeded(path)
-    elts.get(path) match {
-      case Some(schema.Library.NS.Val.Type.HierarchyBlock(member)) =>
-        require(!eltsRefinements.isDefinedAt(path))
+  override def getBlock(path: ref.LibraryPath): Errorable[elem.HierarchyBlock] = {
+    getLibraryPartialMapped(path, "block") {
+      case schema.Library.NS.Val.Type.HierarchyBlock(member) =>
+        require(!eltsRefinements.isDefinedAt(path))  // non-design-top blocks should not have refinements
         member
-      case Some(member) => throw new NoSuchElementException(s"Library element at $path not a block, got ${member.getClass}")
-      case None => throw new NoSuchElementException(s"Library does not contain $path")
     }
   }
-  override def getLink(path: ref.LibraryPath): elem.Link = {
-    fetchEltIfNeeded(path)
-    elts.get(path) match {
-      case Some(schema.Library.NS.Val.Type.Link(member)) => member
-      case Some(member) => throw new NoSuchElementException(s"Library element at $path not a link, got ${member.getClass}")
-      case None => throw new NoSuchElementException(s"Library does not contain $path")
+  override def getLink(path: ref.LibraryPath): Errorable[elem.Link] = {
+    getLibraryPartialMapped(path, "link") {
+      case schema.Library.NS.Val.Type.Link(member) => member
     }
   }
-  override def getPort(path: ref.LibraryPath): IrPort = {
-    fetchEltIfNeeded(path)
-    elts.get(path) match {
-      case Some(schema.Library.NS.Val.Type.Port(member)) => IrPort.Port(member)
-      case Some(schema.Library.NS.Val.Type.Bundle(member)) => IrPort.Bundle(member)
-      case Some(member) => throw new NoSuchElementException(s"Library element at $path not a port-like, got ${member.getClass}")
-      case None => throw new NoSuchElementException(s"Library does not contain $path")
+  override def getPort(path: ref.LibraryPath): Errorable[IrPort] = {
+    getLibraryPartialMapped(path, "port") {
+      case schema.Library.NS.Val.Type.Port(member) => IrPort.Port(member)
+      case schema.Library.NS.Val.Type.Bundle(member) => IrPort.Bundle(member)
     }
   }
 
-  def getDesignTop(path: ref.LibraryPath): (elem.HierarchyBlock, edgrpc.Refinements) = {
-    fetchEltIfNeeded(path)
-    val refinements = eltsRefinements.get(path) match {
-      case Some(refinements) => refinements
-      case None => edgrpc.Refinements()
-    }
-    elts.get(path) match {
-      case Some(schema.Library.NS.Val.Type.HierarchyBlock(member)) =>
+  def getDesignTop(path: ref.LibraryPath): Errorable[(elem.HierarchyBlock, edgrpc.Refinements)] = {
+    getLibraryPartialMapped(path, "block") {
+      case schema.Library.NS.Val.Type.HierarchyBlock(member) =>
+        val refinements = eltsRefinements.get(path) match {
+          case Some(refinements) => refinements
+          case None => edgrpc.Refinements()
+        }
         (member, refinements)
-      case Some(member) => throw new NoSuchElementException(s"Library element at $path not a block, got ${member.getClass}")
-      case None => throw new NoSuchElementException(s"Library does not contain $path")
     }
   }
 

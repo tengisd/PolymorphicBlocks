@@ -11,8 +11,6 @@ from .PortBlocks import PortBridge, PortAdapter
 from .Array import Vector
 from .PortTag import PortTag, Input, Output, InOut
 
-from .Driver import Driver, GeneratorTransform, InstantiationTransform, DesignRefinement  # TODO these should be more internal
-from .SimpleConstProp import SimpleConstPropTransform, CheckErrorsTransform, WriteSolvedParamTransform  # TODO maybe also should be internal
 from .IdentityDict import IdentityDict
 from .MultiBiDict import MultiBiDict
 
@@ -23,5 +21,5 @@ from . import TransformUtil
 from . import edgir
 
 from .HdlInterfaceServer import HdlInterface
-from .ScalaCompilerInterface import ScalaCompiler, CompiledDesign
+from .ScalaCompilerInterface import ScalaCompiler, CompiledDesign, CompilerCheckError
 from .Refinements import Refinements

@@ -26,10 +26,10 @@ class ElectricalLink(CircuitLink):
 
     self.assign(self.voltage, self.source.voltage_out)
     self.assign(self.voltage_limits, self.sinks.intersection(lambda x: x.voltage_limits))
-    self.constrain(self.voltage_limits.contains(self.voltage), "overvoltage")
+    self.require(self.voltage_limits.contains(self.voltage), "overvoltage")
 
     self.assign(self.current_drawn, self.sinks.sum(lambda x: x.current_draw))
-    self.constrain(self.source.current_limits.contains(self.current_drawn), "overcurrent")
+    self.require(self.source.current_limits.contains(self.current_drawn), "overcurrent")
 
 
 class ElectricalSinkBridge(CircuitPortBridge):
@@ -128,11 +128,11 @@ class ElectricalSinkAdapterAnalogSource(CircuitPortAdapter['AnalogSource']):
     self.src = self.Port(ElectricalSink(
       voltage_limits=(-float('inf'), float('inf'))*Volt,
       current_draw=RangeExpr()
-    ), [Input])
+    ))
     self.dst = self.Port(AnalogSource(
       voltage_out=self.src.link().voltage,
       impedance=(0, 0)*Ohm,  # TODO not actually true, but pretty darn low?
-    ), [Output])
+    ))
 
     # TODO might be an overestimate
     self.assign(self.src.current_draw, self.dst.link().current_draw)  # type: ignore
