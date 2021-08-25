@@ -7,9 +7,12 @@ class BlinkyExample(SimpleBoardTop):
     self.jack = self.Block(Pj_102a(voltage_out=3.3*Volt(tol=0.05)))
     self.mcu = self.Block(Lpc1549_48())
     self.connect(self.jack.pwr, self.mcu.pwr)
-    self.led = self.Block(IndicatorLed())
-    self.connect(self.led.signal, self.mcu.digital[0])
-    self.connect(self.led.gnd, self.mcu.gnd, self.jack.gnd)
+    self.connect(self.mcu.gnd, self.jack.gnd)
+    self.led = ElementDict()
+    for i in range(4):
+      self.led[i] = self.Block(IndicatorLed())
+      self.connect(self.led[i].signal, self.mcu.digital[i])
+      self.connect(self.led[i].gnd, self.mcu.gnd)
     # your implementation here
 
 
