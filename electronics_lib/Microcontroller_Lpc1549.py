@@ -64,9 +64,6 @@ class Lpc1549Base_Device(DiscreteChip, FootprintBlock):
     #
     # System Ports
     #
-    self.swd_swdio = self.Port(DigitalBidir(dio_5v_model))
-    self.swd_swclk = self.Port(DigitalSink(dio_5v_model))
-    self.swd_swo = self.Port(DigitalSource(dio_5v_model))
     self.swd_reset = self.Port(DigitalSink(dio_5v_model))
 
     self.xtal = self.Port(CrystalDriver(frequency_limits=(1, 25)*MHertz, voltage_out=self.vdd.link().voltage), optional=True)  # Table 15, 32, 33
@@ -131,9 +128,9 @@ class Lpc1549_48_Device(Lpc1549Base_Device):
       '32': self.xtal_rtc.xtal_out,
 
       '34': self.swd_reset,
-      '33': self.swd_swdio,  # also TMS
-      '29': self.swd_swclk,  # also TCK
-      '9': self.swd_swo,  # also TDO
+      # '33': self.swd_swdio,  # also TMS
+      # '29': self.swd_swclk,  # also TCK
+      # '9': self.swd_swo,  # also TDO
       # 12: JTAG TDI
 
       '35': self.usb_0.dp,
@@ -241,9 +238,9 @@ class Lpc1549_64_Device(Lpc1549Base_Device):
       '43': self.xtal_rtc.xtal_out,
 
       '45': self.swd_reset,
-      '44': self.swd_swdio,  # also TMS
-      '40': self.swd_swclk,  # also TCK
-      '12': self.swd_swo,  # also TDO
+      # '44': self.swd_swdio,  # also TMS
+      # '40': self.swd_swclk,  # also TCK
+      # '12': self.swd_swo,  # also TDO
 
       '47': self.usb_0.dp,
       '48': self.usb_0.dm,
@@ -328,7 +325,7 @@ class Lpc1549Base(Microcontroller, AssignablePinBlock):  # TODO refactor with _D
 
     self.pwr = self.Export(self.ic.vdd, [Power])
     self.gnd = self.Export(self.ic.vss, [Common])
-    self.swd = self.Port(SwdTargetPort())  # TODO
+    self.swd = self.Port(SwdTargetPort(), optional=True)  # TODO
 
     self.xtal = self.Export(self.ic.xtal, optional=True)
     self.xtal_rtc = self.Export(self.ic.xtal_rtc, optional=True)
@@ -392,7 +389,7 @@ class Lpc1549Base(Microcontroller, AssignablePinBlock):  # TODO refactor with _D
                                    self.uart.values(), self.spi.values(),
                                    [self.can_0, self.i2c_0, self.usb_0]),
                    targets=chain([self.ic],  # connected block
-                                 [self.swd.swo, self.swd.swdio, self.swd.swclk, self.swd.reset],
+                                 # [self.swd.swo, self.swd.swdio, self.swd.swclk, self.swd.reset],
                                  self.digital.values(),
                                  self.adc.values(), self.dac.values(),
                                  self.uart.values(), self.spi.values(),
@@ -434,13 +431,8 @@ class Lpc1549Base(Microcontroller, AssignablePinBlock):  # TODO refactor with _D
         ImplicitConnect(self.pwr, [Power]),
         ImplicitConnect(self.gnd, [Common])
     ) as imp:
-      self.swdio_pull = imp.Block(PullupResistor((10, 100) * kOhm(tol=0.05)))
-      self.connect(self.swdio_pull.io, self.swd.swdio, self.ic.swd_swdio)
-      self.swclk_pull = imp.Block(PulldownResistor((10, 100) * kOhm(tol=0.05)))
-      self.connect(self.swclk_pull.io, self.swd.swclk, self.ic.swd_swclk)
       self.reset_pull = imp.Block(PullupResistor(10 * kOhm(tol=0.05)))
-      self.connect(self.reset_pull.io, self.swd.reset, self.ic.swd_reset)
-      self.connect(self.swd.swo, self.ic.swd_swo)
+      self.connect(self.reset_pull.io, self.ic.swd_reset)
 
     # TODO capacitive divider in CLKIN mode; in XO mode see external load capacitors table, see LPC15XX 14.3
 
